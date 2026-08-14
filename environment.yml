@@ -1,0 +1,28 @@
+name: csp
+
+channels:
+  - conda-forge
+  - defaults
+
+dependencies:
+  - python=3.12
+  - pip
+  - matplotlib
+  - numba
+  - numpy
+  - pandas
+  - pillow
+  - py-opencv
+  - pytorch
+  - scikit-image
+  - scikit-learn
+  - scipy
+  - torchvision
+  - tqdm
+  - optuna
+  - conda-forge::statsmodels
+  - conda-forge::openpyxl
+
+  - pip:
+      - shap==0.47.2
+      - xgboost==3.0.2
