@@ -1,8 +1,7 @@
 # Composition–Structure–Property Mapping from OM and SEM Micrographs in Steels
 
 This repository contains the code and data to reproduce the experiments from:
-**“Composition-Structure-Property Mapping from Optical and SEM Micrographs in
-Steels: A Transferable, Explainable AI Framework.”** It provides a
+**“A Transferable, Explainable AI Framework for Composition–Structure–Property Mapping from Steel Micrographs.”** It provides a
 microstructure- and chemistry-aware pipeline for predicting tensile properties
 from optical microscopy (OM) and scanning electron microscopy (SEM) images,
 together with compositional data, with emphasis on explainability and
