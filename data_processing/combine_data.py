@@ -416,6 +416,8 @@ def process_steel_data(literature_excel, features_csv, output_csv, sheet_name='p
     df_image = add_image_features(obs_df, features_csv)
     df_image = unify_morphology_for_ml(df_image, drop_per_method=True)
     final_df = add_physical_units_to_features(df_image)
+    # Calibration has been used for conversion, not as a predictor.
+    final_df = final_df.drop(columns=["um_per_pixel"],errors="ignore")
     final_df["is_bse"] = (final_df["method"] == "SEM:BSE").astype(int)
     
     if output_csv:
@@ -844,7 +846,6 @@ if __name__ == "__main__":
     module_path = str.rsplit(os.path.abspath(''), os.path.sep, 1)[0]
     sys.path.append(module_path)
     print(module_path)
-    from data_processing.clean_data import separate_XY
     
     # ============================================================================
     # Combine literature data and image recognition
@@ -861,6 +862,8 @@ if __name__ == "__main__":
     df_image = add_image_features(obs_df, features_csv_path)
     df_image = unify_morphology_for_ml(df_image, drop_per_method=True)
     final_df = add_physical_units_to_features(df_image)
+    # Calibration has been used for conversion, not as a predictor.
+    final_df = final_df.drop(columns=["um_per_pixel"],errors="ignore")
     final_df["is_bse"] = (final_df["method"] == "SEM: BSE").astype(int)
     ### df_missmatch = check_doi_consistency(final_df)
     

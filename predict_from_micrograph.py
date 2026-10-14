@@ -3,8 +3,8 @@
 Predict Material Properties from a Single Micrograph
 =====================================================
 Author : Gerfried Millner
-Version: 1.1.0
-Date   : 14.08.2026
+Version: 1.2.0
+Date   : 12.10.2026
 Email  : gerfried.millner@ntu.edu.sg
 Status : Development
 
@@ -21,11 +21,11 @@ Step 0  – Configuration
 Step 1  – Load image + mask
 Step 2  – Extract descriptors
 Step 3  – Assemble query DataFrame with metadata
-Step 4  – Unify morphology
-Step 5  – Physical units
-Step 6  – Feature reduction
-Step 7  – Cleaning pipeline
-Step 8  – Feature alignment
+Step 4-6 – Deterministic descriptor reduction (feat_reducer.reduce_descriptors:
+          morphology collapse + fixed 30-column Gram panel; nothing is fitted,
+          so training frame and query rows are reduced by the same row-wise rule)
+Step 7  – Cleaning (fold-safe clean_data pipeline, fitted by the final model)
+Step 8  – Feature schema check
 Step 9  – Model training and validation (XGBoost, per target + modality)
 
 Pre-requisite for the user
@@ -67,22 +67,22 @@ from image_processing.extract_descriptors import (
     extract_all_descriptors,
     GramDescriptorExtractor,
 )
-from data_processing.combine_data import (
-    unify_morphology_for_ml,
-    add_physical_units_to_features,
-    split_images_to_observations,
-)
+from data_processing.combine_data import split_images_to_observations
 from data_processing.feat_reducer import (
-    SmartGramReducer,
-    GLCMReducer,
-    LBPReducer,
+    reduce_descriptors,
+    SchemaValidationError,
 )
 from data_processing.clean_data import (
     fit_cleaning_pipeline,
     apply_cleaning_pipeline,
+    CHEMISTRY_COLUMNS,
+    TARGET_COLUMNS,
 )
 
-from machine_learning.models_paper import train_final_xgb_full
+from machine_learning.models_paper import (
+    train_final_xgb_full,
+    CLEANING_KWARGS,
+)
 
 # ===========================================================================
 # Constants
@@ -157,8 +157,13 @@ class QueryConfig:
         Column name of the target property in the training CSV.
         Examples: "UTS (MPa)", "YS (MPa)", "Total EL (%)".
     id_cols : list[str]
-        Metadata/bookkeeping columns excluded from feature matrices.
-        Defaults cover the full set used across all existing scripts.
+        Kept for backward compatibility only. The cleaning pipeline now uses
+        its own DEFAULT_ID_COLUMNS / DEFAULT_METADATA_COLUMNS (um_per_pixel is
+        deliberately a feature), so this list is NOT passed to it any more.
+    max_imputed_feature_frac : float
+        A warning is logged when more than this fraction of the model
+        features is absent or non-finite in a query and therefore filled
+        with training medians.
 
     Feature extraction
     ------------------
@@ -232,6 +237,7 @@ class QueryConfig:
     run_ml: bool = True
     n_trials: int = 100
     n_splits_inner: int = 5
+    max_imputed_feature_frac: float = 0.20
 
     # --- Output ---
     output_dir: str = ""
@@ -344,6 +350,15 @@ def load_mask(mask_path: Optional[str]) -> Optional[np.ndarray]:
         f"{mask_bool.sum():,} / {mask_bool.size:,} px excluded ({pct:.1f}%)"
     )
     return mask_bool
+
+
+def check_mask_shape(image: np.ndarray, mask: Optional[np.ndarray]) -> None:
+    """Raise if a mask does not have the same (H, W) as its image."""
+    if mask is not None and mask.shape != image.shape:
+        raise ValueError(
+            f"Shape mismatch: image {image.shape} vs mask {mask.shape}. "
+            "Ensure the mask was generated from the same image."
+        )
 
 
 # ===========================================================================
@@ -525,6 +540,7 @@ def build_query_dataframe(
     descriptors: Dict[str, Any],
     config: "QueryConfig",
     strict_scale: bool = True,
+    image_name: str = "",
 ) -> pd.DataFrame:
     """
     Combine raw descriptors with user-supplied metadata into a single-row
@@ -548,13 +564,17 @@ def build_query_dataframe(
     ----------
     descriptors : dict
     config : QueryConfig
+    strict_scale : bool
+    image_name : str
+        Image stem; falls back to config.name when empty (batch mode passes it
+        explicitly because config.name is "" there).
 
     Returns
     -------
     pd.DataFrame (1 row)
     """
     um_per_pixel = _resolve_um_per_pixel(config, strict=strict_scale)
-    image_stem = Path(config.image_path).stem if config.image_path else ""
+    image_stem = image_name or (Path(config.image_path).stem if config.image_path else "")
     row: Dict[str, Any] = dict(descriptors)
     row.update({
         "image_filename": f"{image_stem}.png",
@@ -569,8 +589,14 @@ def build_query_dataframe(
 
     # Elemental composition (wt-%) — one column per element supplied in
     # config.composition. Elements absent from the dict are left unset
-    # here and are zero-filled later by align_features() against X_train,
-    # which is equivalent to "treated as 0 wt-%".
+    # here and are zero-filled by clean_query() before the cleaning pipeline
+    # is applied, which is equivalent to "treated as 0 wt-%".
+    unknown_elements = [e for e in config.composition if e not in CHEMISTRY_COLUMNS]
+    if unknown_elements:
+        logger.warning(
+            f"Composition elements not in CHEMISTRY_COLUMNS are not model "
+            f"features and will be ignored: {unknown_elements}"
+        )
     for element, wt_pct in config.composition.items():
         row[element] = wt_pct
 
@@ -586,154 +612,199 @@ def build_query_dataframe(
 
 
 # ===========================================================================
-# Step 4 – Unify morphology
+# Steps 4-6 – Deterministic descriptor reduction
 # ===========================================================================
 
-def unify_morphology(
-    df_query: pd.DataFrame,
-    df_train: pd.DataFrame,
-    verbose: bool = True,
-) -> tuple:
+def reduce_features(df: pd.DataFrame, label: str = "frame") -> pd.DataFrame:
     """
-    Collapse per-method morphology columns into the canonical morph_* block
-    using unify_morphology_for_ml() from combine_data.
+    Apply feat_reducer.reduce_descriptors() to a frame.
 
-    Parameters
-    ----------
-    df_query : pd.DataFrame
-    df_train : pd.DataFrame
-    verbose : bool
+    The reduction collapses the five candidate segmentations into the
+    canonical morph_* block (highest particle count wins) and replaces the
+    whole Gram family by the fixed 30-column panel. It is row-wise and uses no
+    target and no fitted statistic, so the training frame and every query row
+    go through exactly the same rule that produced the training data.
 
-    Returns
-    -------
-    (df_query_unified, df_train_unified)
+    Physical-unit conversion (add_physical_units_to_features) is no longer
+    part of the pipeline: it only converts columns named feat_*, which neither
+    the descriptor extractor nor the training CSV contains, and um_per_pixel is
+    a model feature on its own.
     """
-    df_train_u = unify_morphology_for_ml(df_train, drop_per_method=True)
-    df_query_u = unify_morphology_for_ml(df_query, drop_per_method=True)
+    try:
+        df_reduced, _ = reduce_descriptors(df)
+    except SchemaValidationError as exc:
+        raise RuntimeError(
+            f"[{label}] Descriptor reduction failed: {exc}\n"
+            "For a query image this usually means that the Gram extractor "
+            "did not run (use_gram=False or GramDescriptorExtractor init "
+            "failed); the fixed Gram panel is required and is never "
+            "filled or zero-padded."
+        ) from exc
 
-    if verbose:
-        logger.info(
-            f"Morphology : unified — "
-            f"train {df_train_u.shape}, query {df_query_u.shape}"
-        )
-    return df_query_u, df_train_u
+    # Candidate-only bookkeeping field. The reducer removes it together with
+    # the per-method columns; a query that took the adaptive path has no
+    # per-method columns, so it is removed here to keep the schemas equal.
+    return df_reduced.drop(columns=["morph_method_used"], errors="ignore")
 
-
-# ===========================================================================
-# Step 5 – Physical unit conversion
-# ===========================================================================
-
-def convert_physical_units(
-    df_query: pd.DataFrame,
-    df_train: pd.DataFrame,
-    verbose: bool = True,
-) -> tuple:
-    """
-    Convert pixel-scale features to µm / µm² using 'um_per_pixel'.
-
-    Parameters
-    ----------
-    df_query : pd.DataFrame
-    df_train : pd.DataFrame
-    verbose : bool
-
-    Returns
-    -------
-    (df_query_physical, df_train_physical)
-    """
-    def _convert_safe(df: pd.DataFrame, label: str) -> pd.DataFrame:
-        if "um_per_pixel" in df.columns and df["um_per_pixel"].notna().any():
-            return add_physical_units_to_features(df)
-        logger.warning(
-            f"{label}: 'um_per_pixel' absent or all-NaN — "
-            f"physical unit conversion skipped."
-        )
-        return df.copy()
-
-    df_train_p = _convert_safe(df_train, "Training")
-    df_query_p = _convert_safe(df_query, "Query")
-
-    if verbose:
-        logger.info("Physical units: conversion complete.")
-    return df_query_p, df_train_p
-
-
-# ===========================================================================
-# Step 6 – Feature reduction
-# ===========================================================================
-
-def apply_feature_reduction(
-    df_train: pd.DataFrame,
-    df_query: pd.DataFrame,
-    verbose: bool = True,
-) -> tuple:
-    """
-    Fit SmartGramReducer and GLCMReducer on the training set, then
-    transform both training set and query rows.
-
-    Returns
-    -------
-    df_train_reduced, df_query_reduced, gram_reducer, glcm_reducer
-    """
-    GRAM_PREFIXES = (
-        "conv1_", "layer1_", "layer2_", "layer3_", "layer4_",
-        "cross_", "multi_scale", "global_",
-    )
-
-    gram_cols_train = [
-        c for c in df_train.columns
-        if any(c.startswith(p) for p in GRAM_PREFIXES)
-    ]
-
-    has_query = df_query is not None and not df_query.empty
-
-    # --- Gram ---
-    if gram_cols_train:
-        logger.info(f"SmartGramReducer: fitting on {len(gram_cols_train)} Gram columns …")
-        gram_reducer = SmartGramReducer()
-        gram_reducer.fit(df_train, verbose=verbose)
-        df_train_g = gram_reducer.transform(df_train, verbose=False)
-        df_query_g = gram_reducer.transform(df_query, verbose=False) if has_query else df_query.copy()
-    else:
-        logger.warning("No Gram columns found — SmartGramReducer skipped.")
-        gram_reducer = None
-        df_train_g = df_train.copy()
-        df_query_g = df_query.copy()
-
-    # --- GLCM ---
-    glcm_cols_post = [c for c in df_train_g.columns if c.startswith("glcm_")]
-    if glcm_cols_post:
-        logger.info(f"GLCMReducer : fitting on {len(glcm_cols_post)} GLCM columns …")
-        glcm_reducer = GLCMReducer()
-        glcm_reducer.fit(df_train_g, verbose=verbose)
-        df_train_r = glcm_reducer.transform(df_train_g, verbose=False)
-        df_query_r = glcm_reducer.transform(df_query_g, verbose=False) if has_query else df_query_g.copy()
-    else:
-        logger.warning("No GLCM columns found — GLCMReducer skipped.")
-        glcm_reducer = None
-        df_train_r = df_train_g.copy()
-        df_query_r = df_query_g.copy()
-
-        # --- LBP ---
-    lbp_cols_post = [c for c in df_train_r.columns if c.startswith("lbp_")]
-    if lbp_cols_post:
-        logger.info(f"LBPReducer  : fitting on {len(lbp_cols_post)} LBP columns …")
-        lbp_reducer = LBPReducer()
-        lbp_reducer.fit(df_train_r, verbose=verbose)
-        df_train_r = lbp_reducer.transform(df_train_r, verbose=False)
-        df_query_r = lbp_reducer.transform(df_query_r, verbose=False) if has_query else df_query_r
-    else:
-        logger.warning("No LBP columns found — LBPReducer skipped.")
-        lbp_reducer = None
-    
-    if verbose:
-        logger.info(f"After reduction : train {df_train_r.shape} query {df_query_r.shape}")
-    
-    return df_train_r, df_query_r, gram_reducer, glcm_reducer, lbp_reducer
 
 # ===========================================================================
 # Step 7 – Cleaning pipeline
 # ===========================================================================
+
+class QueryRemovedByCleaning(ValueError):
+    """The cleaning pipeline dropped the query row (see clean_query)."""
+
+
+def clean_query(
+    df_query: pd.DataFrame,
+    pipeline: Dict[str, Any],
+    name: str = "query",
+    max_imputed_frac: float = 0.20,
+    return_imputed: bool = False,
+):
+    """
+    Clean a one-row query frame with a FITTED cleaning pipeline.
+
+    Steps before apply_cleaning_pipeline
+    ------------------------------------
+    1. Drop all target columns (a NaN target would make the row disappear).
+    2. Require at least one supplied alloying element, then zero-fill every
+       chemistry column of the pipeline that is absent from the query. Without
+       this, apply_cleaning_pipeline fills absent columns with the training
+       MEDIAN, which for elements such as Mn or Si is not "not present".
+    3. Add model features that are absent from the query as NaN columns and
+       record which features are absent or non-finite; the pipeline either
+       drops the row (fewer than 80% of the retained image descriptors
+       present) or fills them with training medians.
+
+    Raises
+    ------
+    ValueError               : no alloying element supplied.
+    QueryRemovedByCleaning   : the row was dropped by the cleaning rules.
+
+    Returns X_query (one row, columns == pipeline["final_columns"]) and, if
+    return_imputed is True, also the list of imputed feature names.
+    """
+    df_q = df_query.drop(
+        columns=[c for c in TARGET_COLUMNS if c in df_query.columns]
+    ).copy()
+
+    chem_cols = list(pipeline["chemistry_cols"])
+    supplied = [
+        c for c in chem_cols
+        if c != "Fe" and c in df_q.columns and df_q[c].notna().any()
+    ]
+    if not supplied:
+        raise ValueError(
+            f"[{name}] No alloying element was supplied in the composition; "
+            "a prediction without chemistry is not meaningful."
+        )
+    for c in chem_cols:
+        if c not in df_q.columns:
+            df_q[c] = 0.0
+
+    final_columns = list(pipeline["final_columns"])
+    imputed: List[str] = []
+    for c in final_columns:
+        if c in chem_cols:
+            continue                      # chemistry NaN is zero-filled, not imputed
+        if c not in df_q.columns:
+            # An absent descriptor column would make apply_cleaning_pipeline
+            # raise before its 80% completeness rule can act. Add it as NaN so
+            # the pipeline decides: row dropped, or value filled by the median.
+            df_q[c] = np.nan
+            imputed.append(c)
+            continue
+        values = pd.to_numeric(df_q[c], errors="coerce").to_numpy(dtype=float)
+        if not np.isfinite(values).all():
+            imputed.append(c)
+
+    X_q, _ = apply_cleaning_pipeline(
+        dataframe=df_q,
+        pipeline=pipeline,
+        target_col=None,
+        verbose=False,
+    )
+
+    if X_q.empty:
+        raise QueryRemovedByCleaning(
+            f"[{name}] The query row was removed by the cleaning pipeline "
+            "(um_per_pixel missing, or fewer than 80% of the retained image "
+            "descriptors present)."
+        )
+
+    if imputed:
+        frac = len(imputed) / max(len(final_columns), 1)
+        message = (
+            f"[{name}] {len(imputed)}/{len(final_columns)} features "
+            f"({frac:.0%}) absent or non-finite in the query; filled with "
+            f"training medians. First 10: {imputed[:10]}"
+        )
+        (logger.warning if frac > max_imputed_frac else logger.info)(message)
+
+    return (X_q, imputed) if return_imputed else X_q
+
+
+def fit_final_model(
+    df_train_r: pd.DataFrame,
+    target: str,
+    n_trials: int = 100,
+    n_splits_inner: int = 5,
+    random_state: int = 42,
+):
+    """
+    Tune and fit the final XGBoost model for one target on the RAW reduced
+    training frame. train_final_xgb_full performs the cleaning itself
+    (fold-local during tuning, full data for the final fit) and returns a
+    bundle holding the model and the fitted cleaning pipeline.
+
+    Inner CV is group-aware when 'sample_id' is available, so images of one
+    sample never sit on both sides of a tuning split.
+
+    Returns (bundle, study).
+    """
+    if target not in df_train_r.columns:
+        raise KeyError(f"Target column '{target}' not found in the training frame.")
+
+    X_raw = df_train_r.drop(columns=[target]).reset_index(drop=True)
+    y_raw = df_train_r[target].reset_index(drop=True)
+
+    use_groups = "sample_id" in X_raw.columns
+    if not use_groups:
+        logger.warning(
+            "'sample_id' not found in the training frame; tuning falls back to "
+            "non-grouped inner CV (images of one sample can leak between folds)."
+        )
+
+    return train_final_xgb_full(
+        X=X_raw,
+        y=y_raw,
+        target_col=target,
+        groups=use_groups,
+        random_state=random_state,
+        n_splits_inner=n_splits_inner,
+        n_trials=n_trials,
+    )
+
+
+def get_training_matrix(bundle: Dict[str, Any], df_train_r: pd.DataFrame, target: str):
+    """
+    Cleaned training matrix and labels belonging to a fitted bundle.
+
+    Uses bundle["X_train_clean"] / ["y_train_clean"] when train_final_xgb_full
+    provides them (exact training matrix). Otherwise the fitted pipeline is
+    applied to the training frame, which gives the same columns and rows.
+    """
+    if "X_train_clean" in bundle and "y_train_clean" in bundle:
+        return bundle["X_train_clean"], bundle["y_train_clean"]
+
+    return apply_cleaning_pipeline(
+        dataframe=df_train_r.reset_index(drop=True),
+        pipeline=bundle["cleaning_pipeline"],
+        target_col=target,
+        verbose=False,
+    )
+
 
 def apply_cleaning(
     df_train: pd.DataFrame,
@@ -742,28 +813,25 @@ def apply_cleaning(
 ) -> tuple:
     """
     Fit the cleaning pipeline on the modality-filtered training set and
-    apply it to the query row.
+    apply it to the query row (standalone helper; the prediction paths use
+    the pipeline stored in the fitted model bundle instead).
 
     Returns
     -------
     X_train, y_train, X_query, pipeline
     """
-    id_cols_present = [c for c in config.id_cols if c in df_train.columns]
-
     X_train, y_train, pipeline = fit_cleaning_pipeline(
-        df=df_train,
+        dataframe=df_train,
         target_col=config.target_property,
-        id_cols=id_cols_present,
-        impute_method="category",
-        handle_inf="clip",
         verbose=config.verbose,
+        **CLEANING_KWARGS,
     )
 
-    X_query, _ = apply_cleaning_pipeline(
-        df=df_query,
-        pipeline=pipeline,
-        target_col=None,
-        verbose=False,
+    X_query = clean_query(
+        df_query,
+        pipeline,
+        name=config.name or "query",
+        max_imputed_frac=config.max_imputed_feature_frac,
     )
 
     logger.info(f"Cleaning done : X_train {X_train.shape} X_query {X_query.shape}")
@@ -780,44 +848,28 @@ def align_features(
     verbose: bool = True,
 ) -> pd.DataFrame:
     """
-    Ensure X_query has exactly the same columns as X_train, in the same order.
+    Verify that X_query has exactly the columns of X_train, in the same order.
 
-    - Columns present in X_train but absent from X_query → zero-filled.
-    - Columns present in X_query but absent from X_train → dropped silently.
-
-    Returns
-    -------
-    X_query_aligned : pd.DataFrame
+    The fitted cleaning pipeline already guarantees this schema. Missing
+    columns are NOT zero-filled here any more: that would silently hide a
+    schema problem, and absent chemistry is handled in clean_query().
+    Raises RuntimeError on any mismatch.
     """
-    train_cols = set(X_train.columns)
-    query_cols = set(X_query.columns)
+    train_cols = list(X_train.columns)
+    query_cols = list(X_query.columns)
 
-    missing = train_cols - query_cols
-    extra   = query_cols - train_cols
-
-    if missing:
-        logger.warning(
-            f"Feature alignment: {len(missing)} column(s) absent from query "
-            f"→ zero-filled. First 10: {sorted(missing)[:10]}"
+    if query_cols != train_cols:
+        missing = sorted(set(train_cols) - set(query_cols))
+        extra = sorted(set(query_cols) - set(train_cols))
+        raise RuntimeError(
+            "Query features do not match the training schema. "
+            f"Missing: {missing[:10]}, extra: {extra[:10]}, "
+            "or the column order differs."
         )
-        X_query = X_query.copy()
-        for col in missing:
-            X_query[col] = 0.0
 
-    if extra and verbose:
-        logger.info(
-            f"Feature alignment: {len(extra)} query column(s) not in "
-            f"training set → dropped."
-        )
-    X_query = X_query.drop(columns=list(extra), errors="ignore")
-    X_query_aligned = X_query[X_train.columns]
-
-    status = "✓ exact match" if (not missing and not extra) else "⚠ padded/trimmed"
-    logger.info(
-        f"Alignment [{status}]: "
-        f"{X_train.shape[1]} features in both train and query."
-    )
-    return X_query_aligned
+    if verbose:
+        logger.info(f"Schema check OK: {len(train_cols)} features in train and query.")
+    return X_query.copy()
 
 
 def _safe_target_name(target: str) -> str:
@@ -853,9 +905,7 @@ def build_observation_metadata(
     obs_df["image_name"] = (
         obs_df["image_name"].astype(str)
         .str.strip()
-        .str.replace(".png",  "", case=False)
-        .str.replace(".tif",  "", case=False)
-        .str.replace(".tiff", "", case=False)
+        .str.replace(r"\.(?:png|tiff?|jpe?g)$", "", case=False, regex=True)
         .str.lower()
     )
 
@@ -870,13 +920,14 @@ def build_observation_metadata(
         f"{before} → {len(obs_df)} observations"
     )
 
-    # Filter 2: material category
-    before = len(obs_df)
-    obs_df = obs_df[obs_df["Category"].isin(material_categories)]
-    logger.info(
-        f"Category filter {material_categories}: "
-        f"{before} → {len(obs_df)} observations"
-    )
+    # Filter 2: material category (empty list = no filter)
+    if material_categories:
+        before = len(obs_df)
+        obs_df = obs_df[obs_df["Category"].isin(material_categories)]
+        logger.info(
+            f"Category filter {material_categories}: "
+            f"{before} → {len(obs_df)} observations"
+        )
 
     if obs_df.empty:
         raise ValueError(
@@ -905,6 +956,11 @@ def enrich_query_with_observation(
         )
 
     obs_row = obs_df.loc[key]
+    if isinstance(obs_row, pd.DataFrame):
+        raise ValueError(
+            f"image_name='{image_name}' occurs {len(obs_row)} times in the "
+            f"observation table; image names must be unique per modality."
+        )
     df = df_query.copy()
 
     if "Material" in obs_row.index:
@@ -981,6 +1037,7 @@ def run_single_image(
     dict keyed by target property, each containing:
         y_pred   : float — predicted value
         model    : fitted sklearn Pipeline (scaler + XGBRegressor)
+        bundle   : dict with model, cleaning_pipeline, feature_columns, ...
         study    : Optuna study object
         X_train  : pd.DataFrame — cleaned training feature matrix
         y_train  : pd.Series   — training labels
@@ -999,9 +1056,6 @@ def run_single_image(
     )
 
     fit_res = fit_feature_pipeline(config)
-    gram_reducer = fit_res["gram_reducer"]
-    glcm_reducer = fit_res["glcm_reducer"]
-    lbp_reducer  = fit_res["lbp_reducer"]  
     df_train_r   = fit_res["df_train_reduced"]
 
     img_path  = Path(image_folder) / f"{name}.png"
@@ -1009,47 +1063,53 @@ def run_single_image(
 
     image = load_image(str(img_path))
     mask  = load_mask(str(mask_path))
+    check_mask_shape(image, mask)
 
     descriptors = extract_descriptors(image, mask, name,
                                       use_gram=config.use_gram,
                                       gram_device=config.gram_device,
                                       verbose=config.verbose)
 
-    df_query = build_query_dataframe(descriptors, config, strict_scale=False)
+    df_query = build_query_dataframe(descriptors, config, strict_scale=False, image_name=name)
     df_query = enrich_query_with_observation(df_query, obs_df, name)  # ← Excel lookup
 
-    df_query_u = unify_morphology_for_ml(df_query, drop_per_method=True)
-    if "um_per_pixel" in df_query_u.columns and df_query_u["um_per_pixel"].notna().any():
-        df_query_p = add_physical_units_to_features(df_query_u)
-    else:
-        df_query_p = df_query_u.copy()
-
-    df_query_g = gram_reducer.transform(df_query_p, verbose=False) if gram_reducer else df_query_p
-    df_query_r = glcm_reducer.transform(df_query_g, verbose=False) if glcm_reducer else df_query_g
-    df_query_r = lbp_reducer.transform(df_query_r, verbose=False) if lbp_reducer else df_query_r 
+    df_query_r = reduce_features(df_query, label=name)
 
     results = {}
     for target in targets:
         config.target_property = target
-        id_cols_present = [c for c in config.id_cols if c in df_train_r.columns]
-        X_train, y_train, pipeline = fit_cleaning_pipeline(
-            df=df_train_r, target_col=target,
-            id_cols=id_cols_present, impute_method="category",
-            handle_inf="clip", verbose=config.verbose,
+
+        fitted, study = fit_final_model(
+            df_train_r,
+            target,
+            n_trials=config.n_trials,
+            n_splits_inner=config.n_splits_inner,
         )
-        df_q = df_query_r.drop(columns=[target], errors="ignore")
-        X_q, _ = apply_cleaning_pipeline(df=df_q, pipeline=pipeline,
-                                          target_col=None, verbose=False)
+        model = fitted["model"]
+        pipeline = fitted["cleaning_pipeline"]
+
+        X_train, y_train = get_training_matrix(fitted, df_train_r, target)
+
+        X_q = clean_query(
+            df_query_r,
+            pipeline,
+            name=name,
+            max_imputed_frac=config.max_imputed_feature_frac,
+        )
         X_q_aligned = align_features(X_train, X_q, verbose=False)
         X_q_aligned.index = [name]
 
-        model, study = train_final_xgb_full(X_train, y_train, groups=False,
-                                             n_trials=config.n_trials,
-                                             n_splits_inner=config.n_splits_inner)
         y_pred = model.predict(X_q_aligned)
-        results[target] = {"y_pred": float(y_pred[0]), "model": model, "study": study,
-                           "X_train": X_train, "y_train": y_train, "X_query": X_q_aligned}
-    
+        results[target] = {
+            "y_pred": float(y_pred[0]),
+            "model": model,
+            "bundle": fitted,
+            "study": study,
+            "X_train": X_train,
+            "y_train": y_train,
+            "X_query": X_q_aligned,
+        }
+
     if save_bundle:
         os.makedirs(config.output_dir, exist_ok=True)
         bundle = {
@@ -1089,27 +1149,17 @@ def fit_feature_pipeline(
         verbose=config.verbose,
     )
 
-    _, df_train_u = unify_morphology(pd.DataFrame(), df_train, verbose=False)
-    _, df_train_p = convert_physical_units(pd.DataFrame(), df_train_u, verbose=config.verbose)
+    df_train_r = reduce_features(df_train, label="training")
+    if config.verbose:
+        logger.info(f"After reduction : train {df_train_r.shape}")
 
-    df_train_r, _, gram_reducer, glcm_reducer, lbp_reducer = apply_feature_reduction(
-        df_train_p, pd.DataFrame(), verbose=config.verbose
-    )
+    return {"df_train_reduced": df_train_r}
 
-    return {
-        "df_train_reduced": df_train_r,
-        "gram_reducer":     gram_reducer,
-        "glcm_reducer":     glcm_reducer,
-        "lbp_reducer":      lbp_reducer,   #
-    }
 
 def transform_single_image(
     image_path: str,
     mask_path: Optional[str],
     config: QueryConfig,
-    gram_reducer,
-    glcm_reducer,
-    lbp_reducer,
     pipeline: Dict[str, Any],
     X_train: pd.DataFrame,
     obs_df: pd.DataFrame,
@@ -1122,10 +1172,8 @@ def transform_single_image(
         1. Load image and exclusion mask
         2. Extract raw descriptors
         3. Enrich metadata from the observation table
-        4. Unify morphology descriptors
-        5. Convert pixel-scale descriptors to physical units
-        6. Apply fitted Gram, GLCM, and LBP reducers
-        7. Apply the fitted cleaning pipeline
+        4. Deterministic descriptor reduction (morphology collapse, Gram panel)
+        5. Apply the fitted cleaning pipeline
         8. Align query features with the training feature matrix
 
     Parameters
@@ -1137,12 +1185,6 @@ def transform_single_image(
         image pixels are retained.
     config : QueryConfig
         Pipeline configuration.
-    gram_reducer : SmartGramReducer or None
-        Fitted Gram-feature reducer.
-    glcm_reducer : GLCMReducer or None
-        Fitted GLCM-feature reducer.
-    lbp_reducer : LBPReducer or None
-        Fitted LBP-feature reducer.
     pipeline : dict
         Fitted cleaning pipeline returned by ``fit_cleaning_pipeline``.
     X_train : pandas.DataFrame
@@ -1156,19 +1198,15 @@ def transform_single_image(
     dict
         Dictionary containing:
         - ``X_query_aligned``: final one-row model input matrix.
-        - ``df_query_raw``: descriptor and metadata row before morphology,
-          physical-unit conversion, reduction, cleaning, and alignment.
+        - ``df_query_raw``: descriptor and metadata row before reduction,
+          cleaning, and alignment.
     """
     image_name = Path(image_path).stem
 
     image = load_image(image_path)
     mask = load_mask(mask_path)
 
-    if mask is not None and mask.shape != image.shape:
-        raise ValueError(
-            f"Shape mismatch: image {image.shape} vs mask {mask.shape}. "
-            "Ensure the mask was generated from the same image."
-        )
+    check_mask_shape(image, mask)
 
     descriptors = extract_descriptors(
         image=image,
@@ -1183,6 +1221,7 @@ def transform_single_image(
         descriptors,
         config,
         strict_scale=False,
+        image_name=image_name,
     )
     df_query = enrich_query_with_observation(
         df_query,
@@ -1190,58 +1229,14 @@ def transform_single_image(
         image_name,
     )
 
-    df_query_u = unify_morphology_for_ml(
-        df_query,
-        drop_per_method=True,
+    df_query_r = reduce_features(df_query, label=image_name)
+
+    X_query = clean_query(
+        df_query_r,
+        pipeline,
+        name=image_name,
+        max_imputed_frac=config.max_imputed_feature_frac,
     )
-
-    if (
-        "um_per_pixel" in df_query_u.columns
-        and df_query_u["um_per_pixel"].notna().any()
-    ):
-        df_query_p = add_physical_units_to_features(df_query_u)
-    else:
-        logger.warning(
-            f"[{image_name}] 'um_per_pixel' absent or NaN; "
-            "physical-unit conversion skipped."
-        )
-        df_query_p = df_query_u.copy()
-
-    df_query_g = (
-        gram_reducer.transform(df_query_p, verbose=False)
-        if gram_reducer is not None
-        else df_query_p.copy()
-    )
-
-    df_query_r = (
-        glcm_reducer.transform(df_query_g, verbose=False)
-        if glcm_reducer is not None
-        else df_query_g.copy()
-    )
-
-    df_query_r = (
-        lbp_reducer.transform(df_query_r, verbose=False)
-        if lbp_reducer is not None
-        else df_query_r.copy()
-    )
-
-    df_query_for_cleaning = df_query_r.drop(
-        columns=[config.target_property],
-        errors="ignore",
-    )
-
-    X_query, _ = apply_cleaning_pipeline(
-        df=df_query_for_cleaning,
-        pipeline=pipeline,
-        target_col=None,
-        verbose=False,
-    )
-
-    if X_query.empty:
-        raise ValueError(
-            f"[{image_name}] Query row is empty after applying the "
-            "cleaning pipeline."
-        )
 
     X_query_aligned = align_features(
         X_train,
@@ -1261,9 +1256,11 @@ def validation_predictions(
     target: str = "UTS (MPa)",
     n_trials: int = 100,
     n_splits_inner: int = 5,
+    random_state: int = 42,
 ) -> tuple:
     """
-    Train final XGB on batch X_train / y_train and predict on X_query_batch.
+    Train the final XGB model on the raw reduced training frame of a batch
+    and predict every query image with the cleaning pipeline of that model.
 
     Parameters
     ----------
@@ -1274,24 +1271,40 @@ def validation_predictions(
 
     Returns
     -------
-    model, study, y_pred (pd.Series indexed by validation image names)
+    model, study, y_pred (pd.Series indexed by validation image names), bundle
     """
-    res_t   = batch["results_by_target"][target]
-    X_train = res_t["X_train"]
-    y_train = res_t["y_train"]
-    X_val   = res_t["X_query_batch"]
+    df_train_r = batch["df_train_raw"]
+    queries = batch["query_rows_reduced"]
+    max_frac = batch.get("max_imputed_feature_frac", 0.20)
 
-    model, study = train_final_xgb_full(
-        X_train,
-        y_train,
-        groups=False,
+    bundle, study = fit_final_model(
+        df_train_r,
+        target,
         n_trials=n_trials,
         n_splits_inner=n_splits_inner,
+        random_state=random_state,
     )
+    pipeline = bundle["cleaning_pipeline"]
 
-    y_pred = model.predict(X_val)
+    rows_X: List[pd.DataFrame] = []
+    for name, df_query_r in queries:
+        try:
+            X_q = clean_query(
+                df_query_r, pipeline, name=name, max_imputed_frac=max_frac
+            )
+        except QueryRemovedByCleaning as exc:
+            logger.warning(f"{exc} Skipped.")
+            continue
+        X_q.index = [name]
+        rows_X.append(X_q)
+
+    if not rows_X:
+        raise RuntimeError(f"No query image survived cleaning for target '{target}'.")
+
+    X_val = pd.concat(rows_X)
+    y_pred = bundle["model"].predict(X_val)
     y_pred_ser = pd.Series(y_pred, index=X_val.index, name=f"y_pred_{target}")
-    return model, study, y_pred_ser
+    return bundle["model"], study, y_pred_ser, bundle
 
 
 def run_ml_validation(
@@ -1335,7 +1348,7 @@ def run_ml_validation(
         for target in targets:
             logger.info(f"  → Training XGB for target: {target}")
 
-            model, study, y_pred = validation_predictions(
+            model, study, y_pred, bundle = validation_predictions(
                 batch,
                 target=target,
                 n_trials=n_trials,
@@ -1344,19 +1357,23 @@ def run_ml_validation(
 
             results[modality_name][target] = {
                 "model":  model,
+                "bundle": bundle,
                 "study":  study,
                 "y_pred": y_pred,
             }
 
             safe_t = _safe_target_name(target)
 
-            # Save model + study as pickles
+            # Save model, study and fitted bundle (model + cleaning pipeline) as pickles
             model_pkl = os.path.join(out_dir, f"xgb_{modality_name}_{safe_t}_model.pkl")
             study_pkl = os.path.join(out_dir, f"xgb_{modality_name}_{safe_t}_study.pkl")
             with open(model_pkl, "wb") as f_out:
                 pickle.dump(model, f_out)
             with open(study_pkl, "wb") as f_out:
                 pickle.dump(study, f_out)
+            bundle_pkl = os.path.join(out_dir, f"xgb_{modality_name}_{safe_t}_bundle.pkl")
+            with open(bundle_pkl, "wb") as f_out:
+                pickle.dump(bundle, f_out)
 
             # Save predictions as CSV
             pred_csv = os.path.join(out_dir, f"xgb_{modality_name}_{safe_t}_predictions.csv")
@@ -1391,7 +1408,7 @@ def process_folder(
     Returns
     -------
     batch_output dict with keys:
-        results_by_target, df_query_raw_batch, df_train_raw
+        results_by_target, df_query_raw_batch, df_train_raw, query_rows_reduced
     """
     if target_properties is None:
         target_properties = [config.target_property]
@@ -1405,22 +1422,23 @@ def process_folder(
         material_categories=config.material_categories,
     )
 
-    # 1) Fit feature reducers ONCE on training set
+    # 1) Reduce the training frame ONCE (deterministic, nothing fitted)
     fit_res      = fit_feature_pipeline(config)
-    gram_reducer = fit_res["gram_reducer"]
-    glcm_reducer = fit_res["glcm_reducer"]
-    lbp_reducer  = fit_res["lbp_reducer"]
     df_train_r   = fit_res["df_train_reduced"]
 
     image_folder = Path(config.image_folder)
     out_dir      = Path(config.output_dir)
     out_dir.mkdir(parents=True, exist_ok=True)
 
-    # 2) Extract descriptors + apply reducers ONCE per image
+    # 2) Extract descriptors + reduce, once per image
     rows_reduced: List[tuple] = []
     rows_raw:     List[pd.DataFrame] = []
 
-    for img_path in sorted(image_folder.glob("*.png")):
+    image_files = sorted(image_folder.glob("*.png"))
+    if not image_files:
+        raise FileNotFoundError(f"No .png images found in {image_folder}")
+
+    for img_path in image_files:
         name      = img_path.stem
         mask_path = image_folder / "masks" / f"{name}_mask.npy"
 
@@ -1428,6 +1446,7 @@ def process_folder(
 
         image = load_image(str(img_path))
         mask  = load_mask(str(mask_path))
+        check_mask_shape(image, mask)
 
         descriptors = extract_descriptors(
             image=image, mask=mask, image_name=name,
@@ -1435,25 +1454,19 @@ def process_folder(
             verbose=config.verbose,
         )
 
-        df_query = build_query_dataframe(descriptors, config, strict_scale=False)
+        df_query = build_query_dataframe(descriptors, config, strict_scale=False, image_name=name)
         df_query = enrich_query_with_observation(df_query, obs_df, name)
 
-        df_query_u = unify_morphology_for_ml(df_query, drop_per_method=True)
-        if "um_per_pixel" in df_query_u.columns and df_query_u["um_per_pixel"].notna().any():
-            df_query_p = add_physical_units_to_features(df_query_u)
-        else:
-            df_query_p = df_query_u.copy()
-
-        df_query_g = gram_reducer.transform(df_query_p, verbose=False) if gram_reducer is not None else df_query_p.copy()
-        df_query_r = glcm_reducer.transform(df_query_g, verbose=False) if glcm_reducer is not None else df_query_g.copy()
-        df_query_r = lbp_reducer.transform(df_query_r, verbose=False) if lbp_reducer is not None else df_query_r.copy()
+        df_query_r = reduce_features(df_query, label=name)
 
         rows_reduced.append((name, df_query_r))
         rows_raw.append(df_query)
 
     df_query_raw_batch = pd.concat(rows_raw, ignore_index=True)
 
-    # 3) Per-target: cleaning + alignment
+    # 3) Per-target: cleaning + schema check
+    #    (inspection copy; the prediction step re-cleans the query rows with
+    #    the pipeline stored in the final model bundle)
     results_by_target: Dict[str, Any] = {}
 
     for target in target_properties:
@@ -1461,37 +1474,32 @@ def process_folder(
 
         config.target_property = target
 
-        id_cols_present = [c for c in config.id_cols if c in df_train_r.columns]
         X_train, y_train, pipeline = fit_cleaning_pipeline(
-            df=df_train_r,
+            dataframe=df_train_r,
             target_col=target,
-            id_cols=id_cols_present,
-            impute_method="category",
-            handle_inf="clip",
             verbose=config.verbose,
+            **CLEANING_KWARGS,
         )
 
         rows_X: List[pd.DataFrame] = []
+        imputed_by_image: Dict[str, List[str]] = {}
         for name, df_query_r in rows_reduced:
-            df_q = df_query_r.copy()
-
-            if target in df_q.columns:
-                df_q = df_q.drop(columns=[target])
-
-            X_q, _ = apply_cleaning_pipeline(
-                df=df_q, pipeline=pipeline, target_col=None, verbose=False,
-            )
-
-            if X_q.empty:
-                logger.warning(
-                    f"[{name}] Skipping: query row empty after cleaning "
-                    f"(df_query_r shape={df_query_r.shape})."
+            try:
+                X_q, imputed = clean_query(
+                    df_query_r,
+                    pipeline,
+                    name=name,
+                    max_imputed_frac=config.max_imputed_feature_frac,
+                    return_imputed=True,
                 )
+            except QueryRemovedByCleaning as exc:
+                logger.warning(f"{exc} Skipped.")
                 continue
 
             X_q_aligned = align_features(X_train, X_q, verbose=False)
             X_q_aligned.index = [name]
             rows_X.append(X_q_aligned)
+            imputed_by_image[name] = imputed
 
         if not rows_X:
             logger.warning(f"No query rows survived cleaning for target '{target}'.")
@@ -1503,12 +1511,17 @@ def process_folder(
         X_train.to_csv(out_dir / f"X_train_{safe_t}.csv")
         y_train.to_csv(out_dir / f"y_train_{safe_t}.csv")
         X_query_batch.to_csv(out_dir / f"X_query_batch_{safe_t}.csv")
+        pd.Series(
+            {n: len(v) for n, v in imputed_by_image.items()},
+            name="n_imputed_features",
+        ).to_csv(out_dir / f"query_imputed_feature_counts_{safe_t}.csv")
 
         results_by_target[target] = {
             "X_train":      X_train,
             "y_train":      y_train,
             "X_query_batch": X_query_batch,
             "pipeline":     pipeline,
+            "query_imputed_features": imputed_by_image,
         }
 
     df_query_raw_batch.to_csv(out_dir / "query_descriptors_batch.csv", index=False)
@@ -1517,6 +1530,8 @@ def process_folder(
         "results_by_target":  results_by_target,
         "df_query_raw_batch": df_query_raw_batch,
         "df_train_raw":       fit_res["df_train_reduced"],
+        "query_rows_reduced": rows_reduced,
+        "max_imputed_feature_frac": config.max_imputed_feature_frac,
     }
     with open(out_dir / "batch_prediction_output.pkl", "wb") as f:
         pickle.dump(batch_output, f)
@@ -1592,7 +1607,6 @@ if __name__ == "__main__":
         print(f"Image folder: {config.image_folder}")
         print(f"Train CSV  : {config.training_dataset_csv}")
         print(f"Output dir : {config.output_dir}")
-        print(f"Image folder: {config.image_folder}")
                        
         batch_output = process_folder(
             config,
@@ -1666,9 +1680,3 @@ if __name__ == "__main__":
     # )
     
     # print({t: results_single[t]["y_pred"] for t in results_single})
-    
-    
-
-            
-        
-        

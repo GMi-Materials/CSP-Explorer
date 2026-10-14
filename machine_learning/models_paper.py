@@ -1,76 +1,130 @@
 # -*- coding: utf-8 -*-
 """
-Created on Mon Jan 19 11:09:36 2026
+Nested group-aware XGBoost modelling with fold-local dynamic cleaning.
 
-@author: gerfried.millner
+All data-derived cleaning decisions are fitted exclusively on each training
+partition and then applied unchanged to its paired validation/test partition.
 """
 
 author = "Gerfried Millner"
-version = "1.0.0"
-date = "31.03.2026"
+version = "1.1.0"
+date = "08.10.2026"
 email = "gerfried.millner@ntu.edu.sg"
 status = "Deliver"
 
+import os
+import sys
+import pickle
+import warnings
+from datetime import datetime
+from pathlib import Path
+
 import numpy as np
 import pandas as pd
-import optuna  
-from sklearn.model_selection import KFold, GroupKFold, cross_val_score
-from sklearn.metrics import mean_absolute_error, mean_squared_error, r2_score
+import optuna
+
 from scipy.stats import pearsonr
-from sklearn.pipeline import Pipeline
-from sklearn.preprocessing import StandardScaler 
-from sklearn.feature_selection import mutual_info_regression
 from sklearn.base import BaseEstimator, TransformerMixin
+from sklearn.metrics import mean_absolute_error, mean_squared_error, r2_score
+from sklearn.model_selection import KFold, GroupKFold
+from sklearn.pipeline import Pipeline
 from xgboost import XGBRegressor
+
+
+# =============================================================================
+# Import fold-local cleaning functions
+# =============================================================================
+
+MODULE_PATH = str.rsplit(os.path.abspath(""), os.path.sep, 1)[0]
+
+if MODULE_PATH not in sys.path:
+    sys.path.insert(0, MODULE_PATH)
+
+from data_processing.clean_data import prepare_clean_fold
+
+
+# =============================================================================
+# Configuration
+# =============================================================================
+
+CLEANING_KWARGS = {
+    "missing_feature_threshold": 0.80,
+    "handle_inf": "clip",
+    "drop_fe": True,
+}
+
+
+# =============================================================================
+# Scaling
+# =============================================================================
 
 def X_scaling(X_in, ref=None):
     """
-    Scale input data using z-score normalization.
-    Binary or constant features are kept unscaled.
+    Apply z-score scaling using statistics fitted on ref.
+
+    Binary and constant features are retained without scaling.
     """
-    X_scal = pd.DataFrame(index=X_in.index)
+    X_in = pd.DataFrame(X_in).copy()
 
     if ref is None:
         ref = X_in
 
-    for col in X_in.columns:
-        if ref[col].nunique() <= 2:
-            X_scal[col] = X_in[col]
+    ref = pd.DataFrame(ref).copy()
+
+    X_scaled = pd.DataFrame(
+        index=X_in.index,
+        columns=X_in.columns,
+        dtype=float,
+    )
+
+    for column in X_in.columns:
+        unique_count = ref[column].nunique(dropna=False)
+
+        if unique_count <= 2:
+            X_scaled[column] = X_in[column]
+            continue
+
+        mean_value = ref[column].mean()
+        std_value = ref[column].std()
+
+        if std_value == 0 or np.isnan(std_value):
+            X_scaled[column] = X_in[column] - mean_value
         else:
-            mean = ref[col].mean()
-            std = ref[col].std()
-            if std == 0 or np.isnan(std):
-                X_scal[col] = X_in[col] - mean
-            else:
-                X_scal[col] = (X_in[col] - mean) / std
-    return X_scal
+            X_scaled[column] = (X_in[column] - mean_value) / std_value
+
+    return X_scaled
+
 
 class CustomScaler(BaseEstimator, TransformerMixin):
     """
-    Sklearn-compatible wrapper around X_scaling.
-    - Learns per-feature mean/std on X in fit().
-    - Applies same stats to new data in transform().
-    - Leaves binary/constant features unscaled.
+    Scikit-learn compatible z-score transformer.
+
+    Statistics are fitted only on each model-training subset.
     """
 
     def __init__(self):
-        self.ref_ = None
+        self.reference_ = None
         self.columns_ = None
 
     def fit(self, X, y=None):
-        X = pd.DataFrame(X)
-        self.ref_ = X.copy()
-        self.columns_ = X.columns
+        X = pd.DataFrame(X).copy()
+        self.reference_ = X.copy()
+        self.columns_ = X.columns.tolist()
         return self
 
     def transform(self, X):
         X = pd.DataFrame(X, columns=self.columns_)
-        X_scaled = X_scaling(X, ref=self.ref_)
-        return X_scaled.values
+        X_scaled = X_scaling(X, ref=self.reference_)
+        return X_scaled.to_numpy(dtype=float)
+
+
+# =============================================================================
+# Metrics
+# =============================================================================
 
 def compute_regression_metrics(y_true, y_pred, tol_rel=0.15):
     """
-    Compute R2, MAE, RMSE, Pearson r, and percentage within relative tolerance.
+    Compute regression metrics for one validation/test partition.
     """
     y_true = np.asarray(y_true).ravel()
     y_pred = np.asarray(y_pred).ravel()
@@ -80,471 +134,859 @@ def compute_regression_metrics(y_true, y_pred, tol_rel=0.15):
     r2 = r2_score(y_true, y_pred)
 
     if np.std(y_true) > 0 and np.std(y_pred) > 0:
-        r, _ = pearsonr(y_true, y_pred)
+        pearsons_r, _ = pearsonr(y_true, y_pred)
     else:
-        r = np.nan
+        pearsons_r = np.nan
 
-    denom = np.abs(y_true)
-    mask = denom > 0
-    if np.any(mask):
-        within = np.abs(y_true[mask] - y_pred[mask]) <= tol_rel * denom[mask]
-        pct_within = 100.0 * within.sum() / within.size
+    denominator = np.abs(y_true)
+    nonzero_mask = denominator > 0
+
+    if np.any(nonzero_mask):
+        within_tolerance = (
+            np.abs(y_true[nonzero_mask] - y_pred[nonzero_mask])
+            <= tol_rel * denominator[nonzero_mask]
+        )
+
+        pct_within_tol = (
+            100.0 * within_tolerance.sum() / within_tolerance.size
+        )
     else:
-        pct_within = np.nan
+        pct_within_tol = np.nan
 
     return {
         "R2": r2,
         "MAE": mae,
         "RMSE": rmse,
-        "Pearsons_r": r,
-        "pct_within_tol": pct_within,
+        "Pearsons_r": pearsons_r,
+        "pct_within_tol": pct_within_tol,
     }
 
-########################################
-################# XGB ##################
-########################################
 
-def make_xgb_full_data_objective(
-    X,
-    Y,
-    groups: bool = False,
-    rands: int = 42,
-    n_splits_inner: int = 5,
-):
-    """
-    Build an Optuna objective for tuning XGBoost on the full dataset.
-    Uses inner CV only (no outer loop here), respecting group structure.
-    The design matrix is:
-        - X.drop(columns=["sample_id"]) if groups is True
-        - X as-is otherwise
-    """
+# =============================================================================
+# Data and split utilities
+# =============================================================================
 
-    # ----- inner CV splitter -----
+def combine_X_y(X, y, target_col):
+    """
+    Reconstruct the raw input table required by prepare_clean_fold().
+
+    The target must not already be present in X. The guard prevents accidental
+    duplication or overwrite of a modelling target.
+    """
+    X = X.copy()
+    y = pd.Series(y).copy()
+
+    if len(X) != len(y):
+        raise ValueError(
+            f"X has {len(X)} rows, but y has {len(y)} rows."
+        )
+
+    if target_col in X.columns:
+        raise ValueError(
+            f"Target column '{target_col}' is already present in X. "
+            "Regenerate source X files after removing their own target."
+        )
+
+    dataframe = X.copy()
+    dataframe[target_col] = y.to_numpy()
+
+    return dataframe
+
+
+def get_cv_splits(X, y, groups=True, n_splits=5, random_state=42):
+    """
+    Construct explicit cross-validation partitions.
+
+    With groups=True, all rows with the same sample_id remain in one fold.
+    """
     if isinstance(groups, bool):
-        if groups is True:
+        if groups:
             if "sample_id" not in X.columns:
-                raise ValueError("groups=True requires 'sample_id' column in X.")
-            group_id = pd.factorize(X["sample_id"])[0]
-            X_use = X.drop(columns=["sample_id"])
-            kf = GroupKFold(n_splits=n_splits_inner)
-            cv_splits = list(kf.split(X_use, Y, group_id))
-        else:
-            X_use = X
-            kf = KFold(
-                n_splits=n_splits_inner,
-                shuffle=True,
-                random_state=rands,
+                raise KeyError(
+                    "groups=True requires the 'sample_id' column in X."
+                )
+
+            group_values = X["sample_id"].to_numpy()
+            n_unique_groups = len(np.unique(group_values))
+
+            if n_unique_groups < n_splits:
+                raise ValueError(
+                    f"Only {n_unique_groups} unique sample_id values are "
+                    f"available for n_splits={n_splits}."
+                )
+
+            splitter = GroupKFold(n_splits=n_splits)
+
+            return list(
+                splitter.split(
+                    X=X,
+                    y=y,
+                    groups=group_values,
+                )
             )
-            cv_splits = list(kf.split(X_use))
-    else:
-        # groups is array-like with custom group labels
-        X_use = X
-        kf = GroupKFold(n_splits=n_splits_inner)
-        cv_splits = list(kf.split(X_use, Y, groups))
 
-    def objective(trial):
-        # ----- search space -----
-        # Keep search modest to avoid overfitting for small n
-        n_estimators = trial.suggest_int("n_estimators", 100, 500, step=100)
-        max_depth = trial.suggest_int("max_depth", 3, 8)
-        learning_rate = trial.suggest_float("learning_rate", 0.01, 0.3, log=True)
-        subsample = trial.suggest_float("subsample", 0.5, 1.0)
-        colsample_bytree = trial.suggest_float("colsample_bytree", 0.4, 1.0)
-        min_child_weight = trial.suggest_float("min_child_weight", 1.0, 10.0)
-        reg_lambda = trial.suggest_float("reg_lambda", 1e-3, 10.0, log=True)
-        reg_alpha = trial.suggest_float("reg_alpha", 1e-3, 10.0, log=True)
-
-        xgb = XGBRegressor(
-            n_estimators=n_estimators,
-            max_depth=max_depth,
-            learning_rate=learning_rate,
-            subsample=subsample,
-            colsample_bytree=colsample_bytree,
-            min_child_weight=min_child_weight,
-            reg_lambda=reg_lambda,
-            reg_alpha=reg_alpha,
-            objective="reg:squarederror",
-            random_state=rands,
-            n_jobs=-1,
-            tree_method="hist",
+        splitter = KFold(
+            n_splits=n_splits,
+            shuffle=True,
+            random_state=random_state,
         )
 
-        pipe = Pipeline([
-            ("scaler", CustomScaler()),
-            ("xgb", xgb),
-        ])
+        return list(splitter.split(X=X, y=y))
 
-        scores = cross_val_score(
-            pipe,
-            X_use.values,
-            np.ravel(Y.values),
-            cv=cv_splits,
-            scoring="r2",
-            n_jobs=-1,
+    group_values = np.asarray(groups)
+
+    if len(group_values) != len(X):
+        raise ValueError(
+            "Custom group labels must have the same length as X."
         )
-        return scores.mean()
 
-    return objective
+    splitter = GroupKFold(n_splits=n_splits)
 
-def train_final_xgb_full(
-    X,
-    Y,
-    groups: bool = False,
-    rands: int = 42,
-    n_splits_inner: int = 5,
-    n_trials: int = 100,
-):
-    """
-    Tune XGBoost hyperparameters with Optuna inner CV and refit on all data.
-    XGBRegressor is trained on the full feature set (all descriptors),
-    dropping only 'sample_id' if groups=True.
-
-    Returns
-    -------
-    final_model : Pipeline
-        Fitted Pipeline(CustomScaler, XGBRegressor).
-    study : optuna.study.Study
-        Optuna study with history and best_params.
-    """
-    objective = make_xgb_full_data_objective(
-        X,
-        Y,
-        groups=groups,
-        rands=rands,
-        n_splits_inner=n_splits_inner,
+    return list(
+        splitter.split(
+            X=X,
+            y=y,
+            groups=group_values,
+        )
     )
 
-    study = optuna.create_study(direction="maximize")
-    study.optimize(objective, n_trials=n_trials, show_progress_bar=False)
-    best_params = study.best_params
 
-    # Prepare full design matrix for final fit
-    if isinstance(groups, bool) and groups is True:
-        if "sample_id" not in X.columns:
-            raise ValueError("groups=True requires 'sample_id' column in X.")
-        X_use = X.drop(columns=["sample_id"])
-    else:
-        X_use = X
+# =============================================================================
+# Fold-local cleaning
+# =============================================================================
 
-    xgb = XGBRegressor(
-        n_estimators=best_params["n_estimators"],
-        max_depth=best_params["max_depth"],
-        learning_rate=best_params["learning_rate"],
-        subsample=best_params["subsample"],
-        colsample_bytree=best_params["colsample_bytree"],
-        min_child_weight=best_params["min_child_weight"],
-        reg_lambda=best_params["reg_lambda"],
-        reg_alpha=best_params["reg_alpha"],
+def prepare_model_fold(
+    dataframe_train,
+    dataframe_validation,
+    target_col,
+    cleaning_kwargs=None,
+    verbose=False,
+):
+    """
+    Fit cleaning on dataframe_train only and apply it to dataframe_validation.
+
+    The retained validation index is deliberately preserved. It identifies the
+    rows eligible for OOF prediction.
+    """
+    if cleaning_kwargs is None:
+        cleaning_kwargs = CLEANING_KWARGS
+
+    (
+        X_train_clean,
+        y_train_clean,
+        X_validation_clean,
+        y_validation_clean,
+        cleaning_pipeline,
+    ) = prepare_clean_fold(
+        dataframe_train=dataframe_train,
+        dataframe_validation=dataframe_validation,
+        target_col=target_col,
+        verbose=verbose,
+        **cleaning_kwargs,
+    )
+
+    if "sample_id" in X_train_clean.columns:
+        raise RuntimeError(
+            "sample_id reached the final training feature matrix."
+        )
+
+    if "sample_id" in X_validation_clean.columns:
+        raise RuntimeError(
+            "sample_id reached the final validation feature matrix."
+        )
+
+    if list(X_train_clean.columns) != list(X_validation_clean.columns):
+        raise RuntimeError(
+            "Training and validation feature schemas differ after cleaning."
+        )
+
+    if not X_train_clean.index.equals(y_train_clean.index):
+        raise RuntimeError(
+            "Cleaned training X and y indices are not aligned."
+        )
+
+    if not X_validation_clean.index.equals(y_validation_clean.index):
+        raise RuntimeError(
+            "Cleaned validation X and y indices are not aligned."
+        )
+
+    return (
+        X_train_clean,
+        y_train_clean,
+        X_validation_clean,
+        y_validation_clean,
+        cleaning_pipeline,
+    )
+
+
+def precompute_cleaned_inner_folds(
+    dataframe_train,
+    target_col,
+    groups=True,
+    n_splits_inner=3,
+    random_state=42,
+    cleaning_kwargs=None,
+):
+    """
+    Precompute deterministic inner-fold cleaning once per outer fold.
+
+    The cleaning procedure depends on inner training data only, not Optuna
+    hyperparameters; therefore reuse across Optuna trials is valid.
+    """
+    if target_col not in dataframe_train.columns:
+        raise KeyError(
+            f"Target column '{target_col}' is not present in dataframe_train."
+        )
+
+    X_for_split = dataframe_train.drop(columns=[target_col])
+    y_for_split = dataframe_train[target_col]
+
+    inner_splits = get_cv_splits(
+        X=X_for_split,
+        y=y_for_split,
+        groups=groups,
+        n_splits=n_splits_inner,
+        random_state=random_state,
+    )
+
+    cleaned_inner_folds = []
+
+    for inner_fold_index, (inner_train_index, inner_valid_index) in enumerate(
+        inner_splits
+    ):
+        dataframe_inner_train = (
+            dataframe_train.iloc[inner_train_index].copy()
+        )
+
+        dataframe_inner_valid = (
+            dataframe_train.iloc[inner_valid_index].copy()
+        )
+
+        (
+            X_inner_train,
+            y_inner_train,
+            X_inner_valid,
+            y_inner_valid,
+            _,
+        ) = prepare_model_fold(
+            dataframe_train=dataframe_inner_train,
+            dataframe_validation=dataframe_inner_valid,
+            target_col=target_col,
+            cleaning_kwargs=cleaning_kwargs,
+            verbose=False,
+        )
+
+        cleaned_inner_folds.append({
+            "fold": inner_fold_index,
+            "X_train": X_inner_train,
+            "y_train": y_inner_train,
+            "X_valid": X_inner_valid,
+            "y_valid": y_inner_valid,
+        })
+
+    return cleaned_inner_folds
+
+
+# =============================================================================
+# XGBoost model construction
+# =============================================================================
+
+def suggest_xgb_parameters(trial):
+    """
+    Define the focused XGBoost hyperparameter search space.
+    """
+    return {
+        "n_estimators": trial.suggest_int(
+            "n_estimators",
+            300,
+            800,
+            step=100,
+        ),
+        "max_depth": trial.suggest_int(
+            "max_depth",
+            3,
+            8,
+        ),
+        "learning_rate": trial.suggest_float(
+            "learning_rate",
+            0.01,
+            0.1,
+            log=True,
+        ),
+        "subsample": trial.suggest_float(
+            "subsample",
+            0.6,
+            1.0,
+        ),
+        "min_child_weight": trial.suggest_float(
+            "min_child_weight",
+            1.0,
+            10.0,
+        ),
+        "reg_lambda": trial.suggest_float(
+            "reg_lambda",
+            1e-2,
+            10.0,
+            log=True,
+        ),
+        "reg_alpha": trial.suggest_categorical(
+            "reg_alpha",
+            [0.0, 1e-3, 1e-2],
+        ),
+    }
+
+
+def build_xgb_regressor(params, random_state=42):
+    """
+    Build an XGBRegressor from an Optuna parameter dictionary.
+    """
+    return XGBRegressor(
+        n_estimators=params["n_estimators"],
+        max_depth=params["max_depth"],
+        learning_rate=params["learning_rate"],
+        subsample=params["subsample"],
+        colsample_bytree=0.8,
+        min_child_weight=params["min_child_weight"],
+        reg_lambda=params["reg_lambda"],
+        reg_alpha=params["reg_alpha"],
         objective="reg:squarederror",
-        random_state=rands,
+        random_state=random_state,
         n_jobs=-1,
         tree_method="hist",
     )
 
-    final_model = Pipeline([
-        ("scaler", CustomScaler()),
-        ("xgb", xgb),
-    ])
-    final_model.fit(X_use, Y)
 
-    return final_model, study
+def build_xgb_pipeline(params, random_state=42):
+    """
+    Build the fitted preprocessing/model pipeline for one XGBoost configuration.
+    """
+    return Pipeline([
+        ("scaler", CustomScaler()),
+        (
+            "xgb",
+            build_xgb_regressor(
+                params=params,
+                random_state=random_state,
+            ),
+        ),
+    ])
+
+
+# =============================================================================
+# Optuna tuning
+# =============================================================================
 
 def make_xgb_optuna_objective(
-    X,
-    Y,
-    groups: bool = False,
-    rands: int = 42,
-    n_splits_inner: int = 5,
+    cleaned_inner_folds,
+    random_state=42,
 ):
     """
-    XGB + Optuna objective with a focused search space for N≈220.
+    Create an Optuna objective evaluated on pre-cleaned inner CV folds.
     """
-
-    # ----- inner CV splitter -----
-    if isinstance(groups, bool):
-        if groups is True:
-            if "sample_id" not in X.columns:
-                raise ValueError("groups=True requires 'sample_id' column in X.")
-            group_id = pd.factorize(X["sample_id"])[0]
-            X_use = X.drop(columns=["sample_id"])
-            kf = GroupKFold(n_splits=n_splits_inner)
-            cv_splits = list(kf.split(X_use, Y, group_id))
-        else:
-            X_use = X
-            kf = KFold(
-                n_splits=n_splits_inner,
-                shuffle=True,
-                random_state=rands,
-            )
-            cv_splits = list(kf.split(X_use))
-    else:
-        X_use = X
-        kf = GroupKFold(n_splits=n_splits_inner)
-        cv_splits = list(kf.split(X_use, Y, groups))
-
     def objective(trial):
-        n_estimators = trial.suggest_int("n_estimators", 300, 800, step=100)
-        max_depth = trial.suggest_int("max_depth", 3, 8)
-        learning_rate = trial.suggest_float("learning_rate", 0.01, 0.1, log=True)
+        params = suggest_xgb_parameters(trial)
+        fold_scores = []
 
-        # Keep one main sampling knob, fix the other
-        subsample = trial.suggest_float("subsample", 0.6, 1.0)
-        colsample_bytree = 0.8
+        for fold_data in cleaned_inner_folds:
+            model = build_xgb_pipeline(
+                params=params,
+                random_state=random_state,
+            )
 
-        # Keep tree-structure regularization
-        min_child_weight = trial.suggest_float("min_child_weight", 1.0, 10.0)
+            model.fit(
+                fold_data["X_train"],
+                fold_data["y_train"],
+            )
 
-        # Prefer L2; keep L1 simple
-        reg_lambda = trial.suggest_float("reg_lambda", 1e-2, 10.0, log=True)
-        reg_alpha = trial.suggest_categorical("reg_alpha", [0.0, 1e-3, 1e-2])
+            y_valid_pred = model.predict(
+                fold_data["X_valid"]
+            )
 
-        xgb = XGBRegressor(
-            n_estimators=n_estimators,
-            max_depth=max_depth,
-            learning_rate=learning_rate,
-            subsample=subsample,
-            colsample_bytree=colsample_bytree,
-            min_child_weight=min_child_weight,
-            reg_lambda=reg_lambda,
-            reg_alpha=reg_alpha,
-            objective="reg:squarederror",
-            random_state=rands,
-            n_jobs=-1,
-            tree_method="hist",
-        )
+            fold_scores.append(
+                r2_score(
+                    fold_data["y_valid"],
+                    y_valid_pred,
+                )
+            )
 
-        pipe = Pipeline([
-            ("scaler", CustomScaler()),
-            ("xgb", xgb),
-        ])
-
-        scores = cross_val_score(
-            pipe,
-            X_use.values,
-            np.ravel(Y.values),
-            cv=cv_splits,
-            scoring="r2",
-            n_jobs=-1,
-        )
-        return scores.mean()
+        return float(np.mean(fold_scores))
 
     return objective
 
 
+# =============================================================================
+# Nested cross-validation
+# =============================================================================
+
 def comp_XGB_model(
     X,
-    Y,
-    groups=False,
-    rands=42,
-    n_trials=50,
+    y,
+    target_col,
+    groups=True,
+    random_state=42,
+    n_trials=100,
     n_splits_outer=5,
-    n_splits_inner=5
+    n_splits_inner=3,
+    cleaning_kwargs=None,
 ):
     """
-    Nested CV with Optuna-tuned XGBoost.
-    Returns
-    -------
-    df : DataFrame
-        R2, MAE, RMSE, Pearson r, pct_within_tol per outer fold.
-    list_models : list
-        Fitted XGB pipelines per outer fold.
-    oof : DataFrame
-        Out-of-fold predictions aligned with the index of X/Y.
-        Columns: 'y_true', 'y_pred', 'fold'.
+    Run nested group-aware CV with fold-local cleaning and Optuna tuning.
+
+    Cleaning is fitted only on each training partition. OOF predictions are
+    retained only for validation rows surviving the fitted scale requirement.
     """
-    # ----- outer CV splitter -----
-    if isinstance(groups, bool):
-        if groups is True:
-            if "sample_id" not in X.columns:
-                raise ValueError("groups=True requires 'sample_id' column in X.")
-            group_id_full = pd.factorize(X["sample_id"])[0]
-            X_use_full = X.drop(columns=["sample_id"])
-            kf_outer = GroupKFold(n_splits=n_splits_outer)
-            outer_splits = kf_outer.split(X_use_full, Y, group_id_full)
-        else:
-            X_use_full = X
-            kf_outer = KFold(n_splits=n_splits_outer, shuffle=True, random_state=rands)
-            outer_splits = kf_outer.split(X_use_full)
-    else:
-        X_use_full = X
-        kf_outer = GroupKFold(n_splits=n_splits_outer)
-        outer_splits = kf_outer.split(X_use_full, Y, groups)
+    X = X.copy().reset_index(drop=True)
+    y = pd.Series(y).copy().reset_index(drop=True)
+
+    dataframe_full = combine_X_y(
+        X=X,
+        y=y,
+        target_col=target_col,
+    )
+
+    outer_splits = get_cv_splits(
+        X=X,
+        y=y,
+        groups=groups,
+        n_splits=n_splits_outer,
+        random_state=random_state,
+    )
 
     metrics_list = []
-    list_models = []
+    fold_models = []
 
-    # OOF containers (aligned to original index)
-    y_pred_oof = pd.Series(index=Y.index, dtype=float)
-    fold_oof = pd.Series(index=Y.index, dtype=int)
+    y_pred_oof = pd.Series(
+        index=dataframe_full.index,
+        dtype=float,
+    )
 
-    for fold_idx, (outer_train_idx, outer_test_idx) in enumerate(outer_splits):
-        X_train = X.iloc[outer_train_idx]
-        Y_train = Y.iloc[outer_train_idx]
-        X_test = X.iloc[outer_test_idx]
-        Y_test = Y.iloc[outer_test_idx]
+    fold_oof = pd.Series(
+        index=dataframe_full.index,
+        dtype="Int64",
+    )
 
-        # Inner Optuna on outer-train data
-        objective = make_xgb_optuna_objective(
-            X_train,
-            Y_train,
+    for fold_index, (outer_train_index, outer_test_index) in enumerate(
+        outer_splits
+    ):
+        print(
+            f"  Outer fold {fold_index + 1}/{n_splits_outer}: "
+            f"{len(outer_train_index)} raw train rows, "
+            f"{len(outer_test_index)} raw test rows"
+        )
+
+        # Keep global indices. They are required for OOF assignment
+        dataframe_outer_train = (
+            dataframe_full.iloc[outer_train_index].copy()
+        )
+
+        dataframe_outer_test = (
+            dataframe_full.iloc[outer_test_index].copy()
+        )
+
+        cleaned_inner_folds = precompute_cleaned_inner_folds(
+            dataframe_train=dataframe_outer_train,
+            target_col=target_col,
             groups=groups,
-            rands=rands,
             n_splits_inner=n_splits_inner,
-        )
-        study = optuna.create_study(direction="maximize")
-        study.optimize(objective, n_trials=n_trials, show_progress_bar=False)
-        best_params = study.best_params
-
-        xgb = XGBRegressor(
-            n_estimators=best_params["n_estimators"],
-            max_depth=best_params["max_depth"],
-            learning_rate=best_params["learning_rate"],
-            subsample=best_params["subsample"],
-            colsample_bytree=0.8,  # fixed, consistent with make_xgb_optuna_objective
-            min_child_weight=best_params["min_child_weight"],
-            reg_lambda=best_params["reg_lambda"],
-            reg_alpha=best_params["reg_alpha"],
-            objective="reg:squarederror",
-            random_state=rands,
-            n_jobs=-1,
-            tree_method="hist",
+            random_state=random_state + fold_index,
+            cleaning_kwargs=cleaning_kwargs,
         )
 
-        if isinstance(groups, bool) and groups is True:
-            if "sample_id" not in X_train.columns:
-                raise ValueError("groups=True requires 'sample_id' column in X.")
-            X_train_use = X_train.drop(columns=["sample_id"])
-            X_test_use = X_test.drop(columns=["sample_id"])
-        else:
-            X_train_use = X_train
-            X_test_use = X_test
+        objective = make_xgb_optuna_objective(
+            cleaned_inner_folds=cleaned_inner_folds,
+            random_state=random_state + fold_index,
+        )
 
-        pipe = Pipeline([
-            ("scaler", CustomScaler()),
-            ("xgb", xgb),
-        ])
+        sampler = optuna.samplers.TPESampler(
+            seed=random_state + fold_index,
+        )
 
-        model = pipe.fit(X_train_use, Y_train)
-        y_pred = model.predict(X_test_use)
+        study = optuna.create_study(
+            direction="maximize",
+            sampler=sampler,
+        )
 
-        # store metrics per fold
-        m = compute_regression_metrics(Y_test, y_pred, tol_rel=0.15)
-        metrics_list.append(m)
-        list_models.append(model)
+        study.optimize(
+            objective,
+            n_trials=n_trials,
+            show_progress_bar=False,
+        )
 
-        # fill OOF containers
-        y_pred_oof.iloc[outer_test_idx] = y_pred
-        fold_oof.iloc[outer_test_idx] = fold_idx
+        (
+            X_outer_train_clean,
+            y_outer_train_clean,
+            X_outer_test_clean,
+            y_outer_test_clean,
+            cleaning_pipeline,
+        ) = prepare_model_fold(
+            dataframe_train=dataframe_outer_train,
+            dataframe_validation=dataframe_outer_test,
+            target_col=target_col,
+            cleaning_kwargs=cleaning_kwargs,
+            verbose=False,
+        )
 
-    df = pd.DataFrame(metrics_list)
+        model = build_xgb_pipeline(
+            params=study.best_params,
+            random_state=random_state + fold_index,
+        )
 
-    oof = pd.DataFrame({
-        "y_true": Y,
+        model.fit(
+            X_outer_train_clean,
+            y_outer_train_clean,
+        )
+
+        y_pred = model.predict(X_outer_test_clean)
+
+        fold_metrics = compute_regression_metrics(
+            y_true=y_outer_test_clean,
+            y_pred=y_pred,
+            tol_rel=0.15,
+        )
+
+        fold_metrics["fold"] = fold_index
+        fold_metrics["n_train_raw"] = len(dataframe_outer_train)
+        fold_metrics["n_train_clean"] = len(X_outer_train_clean)
+        fold_metrics["n_test_raw"] = len(dataframe_outer_test)
+        fold_metrics["n_test_clean"] = len(X_outer_test_clean)
+        fold_metrics["n_features"] = X_outer_train_clean.shape[1]
+
+        metrics_list.append(fold_metrics)
+
+        fold_models.append({
+            "fold": fold_index,
+            "model": model,
+            "cleaning_pipeline": cleaning_pipeline,
+            "feature_columns": X_outer_train_clean.columns.tolist(),
+            "best_params": study.best_params,
+            "best_inner_R2": study.best_value,
+            "outer_metrics": fold_metrics,
+        })
+
+        # Use retained global validation indices, not outer_test_index. This
+        # correctly leaves ineligible no-scale rows without OOF predictions.
+        y_pred_oof.loc[y_outer_test_clean.index] = y_pred
+        fold_oof.loc[y_outer_test_clean.index] = fold_index
+
+    metrics_dataframe = pd.DataFrame(metrics_list)
+
+    oof_dataframe = pd.DataFrame({
+        "y_true": y,
         "y_pred": y_pred_oof,
         "fold": fold_oof,
     })
 
-    return df, list_models, oof
+    oof_dataframe["evaluated"] = oof_dataframe["y_pred"].notna()
 
-############################################
-################# Wrapper ##################
-############################################
+    expected_missing = int(
+        (
+            metrics_dataframe["n_test_raw"]
+            - metrics_dataframe["n_test_clean"]
+        ).sum()
+    )
+
+    observed_missing = int(
+        oof_dataframe["y_pred"].isna().sum()
+    )
+
+    if observed_missing != expected_missing:
+        raise RuntimeError(
+            "Unexpected number of missing OOF predictions: "
+            f"observed={observed_missing}, expected={expected_missing}."
+        )
+
+    return metrics_dataframe, fold_models, oof_dataframe
+
+
+# =============================================================================
+# Final model fitting
+# =============================================================================
+
+def train_final_xgb_full(
+    X,
+    y,
+    target_col,
+    groups=True,
+    random_state=42,
+    n_splits_inner=3,
+    n_trials=100,
+    cleaning_kwargs=None,
+):
+    """
+    Tune XGBoost using group-aware inner CV, then fit on all eligible data.
+
+    The returned bundle contains the fitted cleaning pipeline and fitted model,
+    both of which are necessary to predict from a future raw source table.
+    """
+    X = X.copy().reset_index(drop=True)
+    y = pd.Series(y).copy().reset_index(drop=True)
+
+    dataframe_full = combine_X_y(
+        X=X,
+        y=y,
+        target_col=target_col,
+    )
+
+    cleaned_inner_folds = precompute_cleaned_inner_folds(
+        dataframe_train=dataframe_full,
+        target_col=target_col,
+        groups=groups,
+        n_splits_inner=n_splits_inner,
+        random_state=random_state,
+        cleaning_kwargs=cleaning_kwargs,
+    )
+
+    objective = make_xgb_optuna_objective(
+        cleaned_inner_folds=cleaned_inner_folds,
+        random_state=random_state,
+    )
+
+    sampler = optuna.samplers.TPESampler(
+        seed=random_state,
+    )
+
+    study = optuna.create_study(
+        direction="maximize",
+        sampler=sampler,
+    )
+
+    study.optimize(
+        objective,
+        n_trials=n_trials,
+        show_progress_bar=False,
+    )
+
+    (
+        X_full_clean,
+        y_full_clean,
+        _,
+        _,
+        cleaning_pipeline,
+    ) = prepare_clean_fold(
+        dataframe_train=dataframe_full,
+        dataframe_validation=dataframe_full.copy(),
+        target_col=target_col,
+        verbose=False,
+        **(cleaning_kwargs or CLEANING_KWARGS),
+    )
+
+    final_model = build_xgb_pipeline(
+        params=study.best_params,
+        random_state=random_state,
+    )
+
+    final_model.fit(
+        X_full_clean,
+        y_full_clean,
+    )
+
+    fitted_bundle = {
+        "model": final_model,
+        "cleaning_pipeline": cleaning_pipeline,
+        "feature_columns": X_full_clean.columns.tolist(),
+        "target_column": target_col,
+        "best_params": study.best_params,
+        "best_inner_R2": study.best_value,
+        "n_train_raw": len(dataframe_full),
+        "n_train_clean": len(X_full_clean),
+        "n_features": X_full_clean.shape[1],
+    }
+
+    return fitted_bundle, study
+
+
+# =============================================================================
+# User-facing wrapper
+# =============================================================================
 
 def run_paper_models(
     X,
-    Y,
-    groups: bool = True,
-    rands: int = 42,
-    n_trials: int=100,
+    y,
+    target_col,
+    groups=True,
+    random_state=2026,
+    n_trials=100,
+    cleaning_kwargs=None,
 ):
     """
-    Run the XGB model with nested CV and Optuna tuning.
-
-    Parameters
-    ----------
-    X : pd.DataFrame
-    Y : pd.Series or array-like
-    groups : bool, default True
-        If True, use group-aware CV based on X['sample_id'].
-    rands : int, default 42
-
-    Returns
-    -------
-    summary : pd.DataFrame
-        Single-row summary of metrics for XGB.
-    raw : dict
-        {'Model_XGB': (df_per_fold, model_list, oof_df)}.
+    Run nested CV for one material cohort and one mechanical-property target.
     """
-    results = []
-    raw = {}
-
-    df_XGB, models_XGB, oof_XGB = comp_XGB_model(
-        X, Y,
+    metrics_XGB, fold_models_XGB, oof_XGB = comp_XGB_model(
+        X=X,
+        y=y,
+        target_col=target_col,
         groups=groups,
-        rands=rands,
+        random_state=random_state,
         n_trials=n_trials,
         n_splits_outer=5,
         n_splits_inner=3,
+        cleaning_kwargs=cleaning_kwargs,
     )
-    raw["Model_XGB"] = (df_XGB, models_XGB, oof_XGB)
-    results.append({
-        "model": "Model_XGB",
-        "mean_R2": df_XGB["R2"].mean(),
-        "std_R2": df_XGB["R2"].std(),
-        "mean_MAE": df_XGB["MAE"].mean(),
-        "std_MAE": df_XGB["MAE"].std(),
-        "mean_RMSE": df_XGB["RMSE"].mean(),
-        "std_RMSE": df_XGB["RMSE"].std(),
-        "mean_Pearsons_r": df_XGB["Pearsons_r"].mean(),
-        "std_Pearsons_r": df_XGB["Pearsons_r"].std(),
-        "mean_pct_within_tol": df_XGB["pct_within_tol"].mean(),
-        "std_pct_within_tol": df_XGB["pct_within_tol"].std(),
-    })
 
-    summary = pd.DataFrame(results)
+    summary = pd.DataFrame([{
+        "model": "Model_XGB",
+        "mean_R2": metrics_XGB["R2"].mean(),
+        "std_R2": metrics_XGB["R2"].std(),
+        "mean_MAE": metrics_XGB["MAE"].mean(),
+        "std_MAE": metrics_XGB["MAE"].std(),
+        "mean_RMSE": metrics_XGB["RMSE"].mean(),
+        "std_RMSE": metrics_XGB["RMSE"].std(),
+        "mean_Pearsons_r": metrics_XGB["Pearsons_r"].mean(),
+        "std_Pearsons_r": metrics_XGB["Pearsons_r"].std(),
+        "mean_pct_within_tol": metrics_XGB["pct_within_tol"].mean(),
+        "std_pct_within_tol": metrics_XGB["pct_within_tol"].std(),
+        "mean_n_features": metrics_XGB["n_features"].mean(),
+        "std_n_features": metrics_XGB["n_features"].std(),
+        "mean_n_train_clean": metrics_XGB["n_train_clean"].mean(),
+        "mean_n_test_clean": metrics_XGB["n_test_clean"].mean(),
+        "n_oof_evaluated": int(oof_XGB["evaluated"].sum()),
+        "n_oof_ineligible_no_scale": int((~oof_XGB["evaluated"]).sum()),
+    }])
+
+    raw = {
+        "Model_XGB": {
+            "fold_metrics": metrics_XGB,
+            "fold_models": fold_models_XGB,
+            "oof_predictions": oof_XGB,
+        }
+    }
+
     return summary, raw
 
-if __name__ == "__main__":
-    import warnings, sys, os, pickle
-    from datetime import datetime
-    from pathlib import Path
-    from sklearn.exceptions import ConvergenceWarning
-    warnings.filterwarnings("ignore", category=ConvergenceWarning)
 
-    module_path = str.rsplit(os.path.abspath(""), os.path.sep, 1)[0]
-    sys.path.append(module_path)
+# =============================================================================
+# Script entry point
+# =============================================================================
+
+if __name__ == "__main__":
+    from sklearn.exceptions import ConvergenceWarning
+
+    warnings.filterwarnings(
+        "ignore",
+        category=ConvergenceWarning,
+    )
+
+    optuna.logging.set_verbosity(
+        optuna.logging.WARNING,
+    )
+
+    module_path = str.rsplit(
+        os.path.abspath(""),
+        os.path.sep,
+        1,
+    )[0]
+
+    if module_path not in sys.path:
+        sys.path.insert(0, module_path)
+
     print("Module path:", module_path)
 
-    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-    out_dir = Path(module_path) / "results" / "ML" / timestamp
-    out_dir.mkdir(parents=True, exist_ok=True)
+    timestamp = datetime.now().strftime(
+        "%Y%m%d_%H%M%S"
+    )
 
-    xy_dir = os.path.join(module_path, "data", "Xy")
+    output_directory = (
+        Path(module_path)
+        / "results"
+        / "ML"
+        / timestamp
+    )
+
+    output_directory.mkdir(
+        parents=True,
+        exist_ok=True,
+    )
+
+    xy_directory = os.path.join(
+        module_path,
+        "data",
+        "Xy",
+    )
+
     N_TRIALS = 100
 
-    GROUPS   = ["ss_sem", "ss_om"] # "dp_sem"
-    TARGETS  = ["uts", "ys", "el"]
+    GROUPS = [
+        "ss_sem",
+        "ss_om",
+    ]
 
-    for group in GROUPS:
-        print(f"\n{'='*60}\nGROUP: {group.upper()}\n{'='*60}")
+    TARGETS = {
+        "uts": "UTS (MPa)",
+        "ys": "YS (MPa)",
+        "el": "Total EL (%)",
+    }
 
-        tasks = []
-        for target in TARGETS:
-            X = pd.read_csv(os.path.join(xy_dir, f"X_{group}_{target}.csv"))
-            y = pd.read_csv(os.path.join(xy_dir, f"y_{group}_{target}.csv")).squeeze()
-            tasks.append((target.upper(), X, y))
+    for group_name in GROUPS:
+        print(f"\n{'=' * 70}")
+        print(f"GROUP: {group_name.upper()}")
+        print(f"{'=' * 70}")
 
-        for target_name, X, y in tasks:
-            print(f"\n=== {target_name} ({group}) ===")
-            summary, raw = run_paper_models(
-                X, y,
-                groups=True, rands=2026, n_trials=N_TRIALS,
+        for target_short_name, target_column in TARGETS.items():
+            x_path = os.path.join(
+                xy_directory,
+                f"X_{group_name}_{target_short_name}.csv",
             )
-            print(summary)
-            summary.to_csv(out_dir / f"{group}_{target_name.lower()}_summary.csv", index=False)
-            with open(out_dir / f"{group}_{target_name.lower()}.pkl", "wb") as f:
-                pickle.dump(raw, f)
 
-    print(f"\nAll results saved to: {out_dir}")
-    
+            y_path = os.path.join(
+                xy_directory,
+                f"y_{group_name}_{target_short_name}.csv",
+            )
 
+            X = pd.read_csv(
+                x_path,
+                low_memory=False,
+            )
+
+            y = pd.read_csv(
+                y_path,
+                low_memory=False,
+            ).squeeze("columns")
+
+            print(f"\n--- {target_short_name.upper()} ---")
+            print(
+                f"Raw source data: "
+                f"{X.shape[0]} rows x {X.shape[1]} columns"
+            )
+
+            summary, raw = run_paper_models(
+                X=X,
+                y=y,
+                target_col=target_column,
+                groups=True,
+                random_state=2026,
+                n_trials=N_TRIALS,
+                cleaning_kwargs=CLEANING_KWARGS,
+            )
+
+            print("\nNested-CV summary:")
+            print(summary.to_string(index=False))
+
+            summary_path = (
+                output_directory
+                / f"{group_name}_{target_short_name}_summary.csv"
+            )
+
+            oof_path = (
+                output_directory
+                / f"{group_name}_{target_short_name}_oof.csv"
+            )
+
+            raw_path = (
+                output_directory
+                / f"{group_name}_{target_short_name}_nested_cv.pkl"
+            )
+
+            summary.to_csv(
+                summary_path,
+                index=False,
+            )
+
+            raw["Model_XGB"]["oof_predictions"].to_csv(
+                oof_path,
+                index=False,
+            )
+
+            with open(raw_path, "wb") as file:
+                pickle.dump(raw, file)
+
+    print(f"\nAll results saved to: {output_directory}")

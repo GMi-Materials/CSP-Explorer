@@ -1,0 +1,23 @@
+\begin{table}[t]
+\centering
+\caption{Feature-set ablation under identical nested group-aware cross-validation
+(5 outer folds; identical splits, cleaned rows, seeds and tuning budget for all models).
+Outer-fold $R^2$ is given as mean $\pm$ standard deviation over folds.
+$\Delta R^2$ is the paired per-fold difference (combined $-$ chemistry-only).
+No significance test was performed.}
+\label{tab:ablation}
+\small
+\begin{tabular}{llcccc}
+\toprule
+Cohort & Target & Chemistry & Image & Combined & $\Delta R^2$ \\
+\midrule
+SEM & UTS & $0.790 \pm 0.055$ & $0.484 \pm 0.146$ & $0.812 \pm 0.034$ & $+0.022 \pm 0.036$ \\
+ & YS & $0.779 \pm 0.035$ & $0.579 \pm 0.066$ & $0.750 \pm 0.048$ & $-0.029 \pm 0.050$ \\
+ & EL & $0.706 \pm 0.048$ & $0.494 \pm 0.071$ & $0.710 \pm 0.071$ & $+0.004 \pm 0.073$ \\
+\midrule
+OM & UTS & $0.801 \pm 0.073$ & $0.489 \pm 0.088$ & $0.757 \pm 0.052$ & $-0.044 \pm 0.053$ \\
+ & YS & $0.737 \pm 0.060$ & $0.428 \pm 0.126$ & $0.705 \pm 0.071$ & $-0.032 \pm 0.037$ \\
+ & EL & $0.551 \pm 0.054$ & $0.297 \pm 0.139$ & $0.496 \pm 0.121$ & $-0.055 \pm 0.146$ \\
+\bottomrule
+\end{tabular}
+\end{table}

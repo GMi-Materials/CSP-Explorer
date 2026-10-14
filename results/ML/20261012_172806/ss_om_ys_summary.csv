@@ -1,0 +1,2 @@
+model,mean_R2,std_R2,mean_MAE,std_MAE,mean_RMSE,std_RMSE,mean_Pearsons_r,std_Pearsons_r,mean_pct_within_tol,std_pct_within_tol,mean_n_features,std_n_features,mean_n_train_clean,mean_n_test_clean,n_oof_evaluated,n_oof_ineligible_no_scale
+Model_XGB,0.7051825076626834,0.07091096663003338,82.29581941161537,6.7375017285364285,112.26655453240883,8.248844792510864,0.8444783398039846,0.04657973174353094,52.82547237121537,6.839519873991842,95.8,0.8366600265340756,247.2,61.8,309,20

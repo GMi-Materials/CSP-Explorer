@@ -1,0 +1,21 @@
+{
+  "model": "XGB",
+  "target_col": "Total EL (%)",
+  "n_splits_outer": 3,
+  "n_splits_inner": 3,
+  "n_trials_inner": 100,
+  "subsample_unit": "row",
+  "base_seed": 42,
+  "tune_on_dp_only": false,
+  "align_columns": false,
+  "clip": [
+    0.1,
+    10.0
+  ],
+  "cleaning_kwargs": {
+    "missing_feature_threshold": 0.8,
+    "handle_inf": "clip",
+    "drop_fe": true
+  },
+  "seed_scheme": "seedsequence-v1"
+}

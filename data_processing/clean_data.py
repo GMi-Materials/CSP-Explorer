@@ -1,1031 +1,1661 @@
+#!/usr/bin/env python3
 # -*- coding: utf-8 -*-
+
 """
+Fold-safe data cleaning utilities for CSP Explorer.
+
+Input
+-----
+This module expects the deterministic, target-independent reduced descriptor
+table at:
+
+    data/descriptors_reduced.csv
+
+Output
+------
+When run directly, this module writes target-specific source tables to:
+
+    data/Xy/X_ss_sem_uts.csv
+    data/Xy/y_ss_sem_uts.csv
+    data/Xy/X_ss_sem_ys.csv
+    data/Xy/y_ss_sem_ys.csv
+    data/Xy/X_ss_sem_el.csv
+    data/Xy/y_ss_sem_el.csv
+
+    data/Xy/X_ss_om_uts.csv
+    data/Xy/y_ss_om_uts.csv
+    data/Xy/X_ss_om_ys.csv
+    data/Xy/y_ss_om_ys.csv
+    data/Xy/X_ss_om_el.csv
+    data/Xy/y_ss_om_el.csv
+
+    data/Xy/X_dp_sem_uts.csv
+    data/Xy/y_dp_sem_uts.csv
+    data/Xy/X_dp_sem_ys.csv
+    data/Xy/y_dp_sem_ys.csv
+    data/Xy/X_dp_sem_el.csv
+    data/Xy/y_dp_sem_el.csv
+
+The exported X files are source tables, not final globally cleaned ML matrices.
+They retain sample_id for grouped cross-validation. Data-derived operations
+such as rare-support chemistry removal, constant removal, morphology coverage
+screening, high-missingness removal, infinity clipping, and
+median imputation must be fitted on each training fold only through
+fit_cleaning_pipeline() and then applied unchanged to the validation fold with
+apply_cleaning_pipeline().
+
 Author: Gerfried Millner
-Version: 1.0.1
-Date: 03.06.2026
+Version: 1.3.0
+Date: 12.10.2026
 Email: gerfried.millner@ntu.edu.sg
 Status: Deliver
 
-@author: gerfried.millner
 """
 
-import pandas as pd
+from __future__ import annotations
+
+import sys
+from pathlib import Path
+from typing import Any, Iterable
+
 import numpy as np
-from sklearn.impute import SimpleImputer
-from statsmodels.stats.outliers_influence import variance_inflation_factor
-import warnings
-warnings.filterwarnings('ignore')
+import pandas as pd
 
-def filter_by_subcategory(df, subcategory, category_coulmn="Category", drop_col=True):
-    """
-    Filter dataframe by Material Subcategory.
-    
-    Args:
-        df: DataFrame with Category column
-        subcategory: String name of subcategory (e.g., 'Dual-Phase (DP) Steel')
-                     OR list of subcategory names
-        category_coulmn: String, name of category column
-    
-    Returns:
-        Filtered DataFrame
-    """
-    if category_coulmn not in df.columns:
-        print("Error: "+str(category_coulmn)+" column not found.")
-        return None
-    
-    # Convert single string to list for uniform handling
-    if isinstance(subcategory, str):
-        subcategory_list = [subcategory]
-    else:
-        subcategory_list = subcategory
-    
-    # Filter using isin() to match any subcategory in the list
-    filtered_df = df[df[category_coulmn].isin(subcategory_list)].copy()
-    
-    # Print filtering results
-    if len(subcategory_list) == 1:
-        print(f"Filtered to: {subcategory_list[0]}")
-    else:
-        print(f"Filtered to {len(subcategory_list)} subcategories: {', '.join(subcategory_list)}")
-    print(f"Samples: {len(filtered_df)}")
-    
-    if drop_col:
-        filtered_df = filtered_df.drop(category_coulmn, axis=1)
-    
-    return filtered_df
+# =============================================================================
+# Fixed schema definitions
+# =============================================================================
 
-def calculate_balance_composition(Xin, col_chemistry):
-    """
-    Calculate and fill the balance composition for each row.
-    For Steel, balance is Fe. For other materials, balance is the base element.
-    
-    Parameters:
-        Xin (pd.DataFrame): Input dataframe
-        col_chemistry (list): List of chemical element columns
-    
-    Returns:
-        pd.DataFrame: Dataframe with updated balance compositions
-    """
-    X_out = Xin.copy(deep=True)
-    
-    for idx, row in X_out.iterrows():
-        material = row.get("Material", "Steel")
-        
-        if material == "Steel":
-            other_elements = [col for col in col_chemistry if col != "Fe"]
-            other_sum = sum(row[col] if pd.notna(row[col]) else 0 
-                          for col in other_elements if col in X_out.columns)
-            X_out.loc[idx, "Fe"] = 100 - other_sum
-            
-        elif material in col_chemistry:
-            other_elements = [col for col in col_chemistry if col != material]
-            other_sum = sum(row[col] if pd.notna(row[col]) else 0 
-                          for col in other_elements if col in X_out.columns)
-            X_out.loc[idx, material] = 100 - other_sum
-    
-    return X_out
+TARGET_COLUMNS = (
+    "YS (MPa)",
+    "UTS (MPa)",
+    "Uniform EL (%)",
+    "Total EL (%)",
+    "Area Reduction (%)",
+    "Absorbed Energy (J/cm²)",
+    "Hardness (HV)",
+    "n2",
+    "Young modulus [GPa]",
+)
+
+CHEMISTRY_COLUMNS = (
+    "Al",
+    "B",
+    "C",
+    "Ca",
+    "Ce",
+    "Co",
+    "Cr",
+    "Cu",
+    "Er",
+    "La",
+    "Mg",
+    "Mn",
+    "Mo",
+    "N",
+    "Nb",
+    "Ni",
+    "O",
+    "P",
+    "S",
+    "Si",
+    "Sm",
+    "Sn",
+    "Ti",
+    "Ta",
+    "V",
+    "W",
+    "Zn",
+    "Zr",
+    "Fe",
+)
+
+# Never pass identifiers to the model. sample_id is retained in exported source
+# tables but removed by _build_feature_matrix() during fold-level cleaning.
+DEFAULT_ID_COLUMNS = (
+    "obs_id",
+    "sample_id",
+    "Sample",
+    "DOI",
+    "ID_name",
+    "id_name",
+    "image_file",
+    "image_file.1",
+    "image_name",
+    "image_number",
+    "Paper_ID",
+    "subfolder",
+    "Fig",
+    "doi",
+    "doi_norm",
+    "doi_url",
+    "pdf_filename",
+    "extraction_date",
+    "image_name_norm",
+)
+
+# These fields identify source, acquisition, or annotation context rather than
+# transferable physical predictors. 
+DEFAULT_METADATA_COLUMNS = (
+    "Material",
+    "Category",
+    "method",
+    "resolution_um",
+    "resolution_px",
+    "cls_type",
+    "cls_confidence",
+    "morph_source",
+)
 
 
-def diagnose_nan_patterns(df, target_col='UTS (MPa)', show_plot=True):
-    """
-    Comprehensive NaN diagnosis by feature category.
-    
-    Parameters:
-        df: DataFrame with features
-        target_col: Target column name
-        show_plot: Whether to show visualization
-    
-    Returns:
-        DataFrame with category statistics
-    """
-    print(f"\n{'='*80}")
-    print("NaN DIAGNOSIS BY FEATURE CATEGORY")
-    print(f"{'='*80}\n")
-    
-    # Define feature categories with automatic detection
-    feature_categories = {
-        'Target': [target_col],
-        'Chemistry': ["Al", "B", "C", "Ca", "Ce", "Co", "Cr", "Cu", "Er", "La", "Mg", "Mn",
-                      "Mo", "N", "Nb", "Ni", "O", "P", "S", "Si", "Sm", "Sn", "Ti", "Ta",
-                      "V", "W", "Zn", "Zr", "Fe"],
-        'Scale': [c for c in df.columns if 'um_per_pixel' in c or 'resolution' in c],
-        'Morphology': [c for c in df.columns if c.startswith('morph_')],
-        'GLCM': [c for c in df.columns if c.startswith('glcm_')],
-        'LBP': [c for c in df.columns if c.startswith('lbp_')],
-        'S2': [c for c in df.columns if c.startswith('s2_')],
-        'Gram_conv1': [c for c in df.columns if c.startswith('conv1_')],
-        'Gram_layer1': [c for c in df.columns if c.startswith('layer1_')],
-        'Gram_layer2': [c for c in df.columns if c.startswith('layer2_')],
-        'Gram_layer3': [c for c in df.columns if c.startswith('layer3_')],
-        'Gram_layer4': [c for c in df.columns if c.startswith('layer4_')],
-        'Gram_cross': [c for c in df.columns if c.startswith('cross_')],
-        'Gram_global': [c for c in df.columns if c.startswith('global_') or c.startswith('multi_scale')],
-    }
-    
-    category_stats = []
-    
-    for cat_name, cols in feature_categories.items():
-        available = [c for c in cols if c in df.columns]
-        if not available:
-            continue
-            
-        cat_data = df[available]
-        n_features = len(available)
-        avg_nan_pct = cat_data.isna().mean().mean() * 100
-        rows_all_nan = cat_data.isna().all(axis=1).sum()
-        rows_any_nan = cat_data.isna().any(axis=1).sum()
-        rows_complete = len(df) - rows_any_nan
-        
-        category_stats.append({
-            'Category': cat_name,
-            'N_Features': n_features,
-            'Avg_NaN_%': avg_nan_pct,
-            'Rows_All_NaN': rows_all_nan,
-            'Rows_Any_NaN': rows_any_nan,
-            'Rows_Complete': rows_complete
-        })
-        
-        # Status indicator
-        if avg_nan_pct < 5:
-            status = "✓ GOOD"
-        elif avg_nan_pct < 50:
-            status = "⚠ FAIR"
-        else:
-            status = "❌ POOR"
-        
-        print(f"{status:12} {cat_name:20} Features: {n_features:3d}  |  Avg NaN: {avg_nan_pct:5.1f}%  |  "
-              f"Complete rows: {rows_complete:4d}/{len(df)} ({100*rows_complete/len(df):5.1f}%)")
-    
-    stats_df = pd.DataFrame(category_stats).sort_values('Avg_NaN_%', ascending=False)
-    
-    # Visualization
-    if show_plot:
-        import matplotlib.pyplot as plt
-        
-        fig, axes = plt.subplots(1, 2, figsize=(14, 5))
-        
-        # Plot 1: Avg NaN by category
-        colors = ['red' if x > 50 else 'orange' if x > 20 else 'yellow' if x > 5 else 'green' 
-                 for x in stats_df['Avg_NaN_%']]
-        axes[0].barh(stats_df['Category'], stats_df['Avg_NaN_%'], color=colors, alpha=0.7)
-        axes[0].set_xlabel('Average NaN (%)', fontsize=11)
-        axes[0].set_title('NaN Percentage by Category', fontsize=12, fontweight='bold')
-        axes[0].axvline(50, color='red', linestyle='--', alpha=0.5, linewidth=1.5, label='50%')
-        axes[0].axvline(20, color='orange', linestyle='--', alpha=0.5, linewidth=1.5, label='20%')
-        axes[0].axvline(5, color='green', linestyle='--', alpha=0.5, linewidth=1.5, label='5%')
-        axes[0].legend()
-        axes[0].grid(alpha=0.3, axis='x')
-        
-        # Plot 2: Complete rows by category
-        axes[1].barh(stats_df['Category'], stats_df['Rows_Complete'], color='steelblue', alpha=0.7)
-        axes[1].set_xlabel('Number of Complete Rows', fontsize=11)
-        axes[1].set_title('Complete Rows per Category', fontsize=12, fontweight='bold')
-        axes[1].grid(alpha=0.3, axis='x')
-        
-        plt.tight_layout()
-        plt.show()
-    
-    return stats_df
+# =============================================================================
+# Fixed cohorts and exported targets
+# =============================================================================
 
-def diagnose_infinity_sources(df, show_top=20):
+STAINLESS_CATEGORIES = (
+    "Ferritic Stainless Steel",
+    "Duplex Stainless Steel",
+    "Austenitic Stainless Steel",
+)
+
+DUAL_PHASE_CATEGORIES = (
+    "Conventional DP",
+)
+
+GROUP_DEFINITIONS: dict[str, dict[str, tuple[str, ...]]] = {
+    "ss_sem": {
+        "categories": STAINLESS_CATEGORIES,
+        "methods": (
+            "SEM: SE",
+            "SEM: BSE",
+        ),
+    },
+    "ss_om": {
+        "categories": STAINLESS_CATEGORIES,
+        "methods": (
+            "OM",
+        ),
+    },
+    "dp_sem": {
+        "categories": DUAL_PHASE_CATEGORIES,
+        "methods": (
+            "SEM: SE",
+            "SEM: BSE",
+        ),
+    },
+}
+
+TARGET_DEFINITIONS = {
+    "uts": "UTS (MPa)",
+    "ys": "YS (MPa)",
+    "el": "Total EL (%)",
+}
+
+
+IMAGE_DESCRIPTOR_PREFIXES = (
+    "morph_",
+    "glcm_",
+    "lbp_",
+    "s2_",
+    "conv1_",
+    "layer1_",
+    "layer2_",
+    "layer3_",
+    "layer4_",
+    "cross_",
+    "global_",
+    "multiscale_",
+)
+
+# Canonical morphology predictors produced by feat_reducer.MorphologyReducer.
+# morph_n_particles and morph_source are never NaN by
+# construction, so they are not screened here.
+CANONICAL_MORPHOLOGY_FEATURES = (
+    "morph_area_mean",
+    "morph_diameter_mean",
+    "morph_aspect_ratio_mean",
+    "morph_eccentricity_mean",
+)
+
+# =============================================================================
+# Cohort filtering and row alignment
+# =============================================================================
+
+def filter_by_subcategory(
+    dataframe: pd.DataFrame,
+    subcategory: str | Iterable[str],
+    category_column: str = "Category",
+    drop_col: bool = False,
+) -> pd.DataFrame:
     """
-    Identify which features have infinity values.
-    Useful for debugging extraction code.
-    
-    Parameters:
-        df: DataFrame to check
-        show_top: Number of features to show
-    
-    Returns:
-        DataFrame with infinity statistics
+    Filter rows by one or more Category values.
+
+    This fixed cohort-selection operation is safe before cross-validation.
     """
-    print(f"\n{'='*80}")
-    print("INFINITY VALUE DIAGNOSIS")
-    print(f"{'='*80}\n")
-    
-    num_cols = df.select_dtypes(include=[np.number]).columns
-    
-    inf_stats = []
-    for col in num_cols:
-        n_pos_inf = (df[col] == np.inf).sum()
-        n_neg_inf = (df[col] == -np.inf).sum()
-        n_total_inf = n_pos_inf + n_neg_inf
-        
-        if n_total_inf > 0:
-            inf_stats.append({
-                'Feature': col,
-                'Pos_Inf': n_pos_inf,
-                'Neg_Inf': n_neg_inf,
-                'Total_Inf': n_total_inf,
-                'Pct_Inf': (n_total_inf / len(df)) * 100
-            })
-    
-    if not inf_stats:
-        print("✓ No infinity values found!")
-        return pd.DataFrame()
-    
-    inf_df = pd.DataFrame(inf_stats).sort_values('Total_Inf', ascending=False)
-    
-    print(f"Found {len(inf_df)} features with infinity values")
-    print(f"Total infinity values: {inf_df['Total_Inf'].sum():,}\n")
-    
-    print(f"{'Feature':<50} {'Pos_Inf':>10} {'Neg_Inf':>10} {'Total':>10} {'%':>8}")
-    print("-" * 90)
-    
-    for _, row in inf_df.head(show_top).iterrows():
-        print(f"{row['Feature']:<50} {row['Pos_Inf']:>10.0f} {row['Neg_Inf']:>10.0f} "
-              f"{row['Total_Inf']:>10.0f} {row['Pct_Inf']:>7.1f}%")
-    
-    if len(inf_df) > show_top:
-        print(f"\n... and {len(inf_df) - show_top} more features")
-    
-    # Categorize infinity sources
-    print(f"\n{'='*80}")
-    print("INFINITY BY CATEGORY")
-    print(f"{'='*80}\n")
-    
-    categories = {
-        'Gram': inf_df[inf_df['Feature'].str.contains('conv|layer|cross_|global_|multi_scale', case=False)],
-        'GLCM': inf_df[inf_df['Feature'].str.startswith('glcm_')],
-        'S2': inf_df[inf_df['Feature'].str.startswith('s2_')],
-        'Morphology': inf_df[inf_df['Feature'].str.startswith('morph_')],
-        'LBP': inf_df[inf_df['Feature'].str.startswith('lbp_')],
-        'Other': inf_df[~inf_df['Feature'].str.contains('conv|layer|cross_|global_|multi_scale|glcm_|s2_|morph_|lbp_', case=False)]
-    }
-    
-    for cat, data in categories.items():
-        if len(data) > 0:
-            print(f"{cat:15}: {len(data):3d} features, {data['Total_Inf'].sum():6.0f} infinity values")
-    
-    return inf_df
-
-def clean_multicollinearity(
-    X,
-    composition_cols,
-    vif_threshold=10.0,
-    pairwise_corr_threshold=0.9,
-    comp_corr_threshold=0.95,
-    protect_elements=("Fe",),
-):
-    """
-    Generic multicollinearity reduction with:
-      - automatic composite formation for strongly coupled composition pairs
-      - VIF-based pruning for non-composition features.
-
-    Parameters
-    ----------
-    X : pd.DataFrame
-        Input feature matrix. 
-    composition_cols : list of str
-        Columns treated as composition (elements, composites). They are
-        never dropped by the VIF pruning step.
-    vif_threshold : float
-        VIF cutoff for non-composition features.
-    pairwise_corr_threshold : float
-        |r| threshold for treating non-composition pairs as "very strongly
-        correlated" when deciding which feature to drop.
-    comp_corr_threshold : float
-        |r| threshold for detecting strongly coupled composition pairs
-        that will be merged into composites.
-    protect_elements : tuple of str
-        Composition columns that must never be removed or merged
-        (e.g. ("Fe",) to always keep Fe explicit).
-
-    Returns
-    -------
-    X_reduced : pd.DataFrame
-        Feature matrix after multicollinearity reduction.
-    removed_features : list of str
-        Features removed or merged during the procedure.
-    created_composites : list of str
-        Names of composition composites that were created.
-    """
-
-    if "sample_id" in X.columns:
-        X_work = X.drop(columns="sample_id").copy()
-    else:
-        X_work = X.copy()
-    removed = []
-    created_composites = []
-
-    # ------------------------------------------------------------------
-    # 1. Automatic composites for strongly coupled composition pairs
-    # ------------------------------------------------------------------
-    # Start from composition_cols, but keep only columns that currently exist
-    comp_cols_present = [c for c in composition_cols if c in X_work.columns]
-    
-    # If there are fewer than 2 composition columns, nothing to do
-    if len(comp_cols_present) > 1:
-        comp_corr = X_work[comp_cols_present].corr().abs()
-    
-        # Find pairs of composition features with |r| > comp_corr_threshold
-        high_pairs = np.where(
-            (comp_corr > comp_corr_threshold) & (comp_corr < 1.0)
+    if category_column not in dataframe.columns:
+        raise KeyError(
+            f"Required category column '{category_column}' was not found."
         )
-        comp_pairs = sorted(
-            {tuple(sorted((comp_corr.index[i], comp_corr.columns[j])))
-             for i, j in zip(*high_pairs)}
-        )
-    
-        for a, b in comp_pairs:
-            # Skip if either element is protected (e.g. Fe)
-            if a in protect_elements or b in protect_elements:
-                continue
-    
-            # SAFETY: re-check that both columns still exist
-            if a not in X_work.columns or b not in X_work.columns:
-                continue
-    
-            new_name = f"{a}_plus_{b}"
-            if new_name in X_work.columns:
-                continue  # already created earlier
-    
-            # Create composite as sum; interpretable as total addition of a and b
-            X_work[new_name] = X_work[a] + X_work[b]
-            created_composites.append(new_name)
-    
-            # Drop originals (now encoded in the composite)
-            for col in (a, b):
-                if col in X_work.columns:
-                    X_work = X_work.drop(columns=col)
-                    removed.append(col)
-    
-            # Track the new composite as a composition column
-            comp_cols_present.append(new_name)
-    
-    # Refresh composition_cols after any changes
-    composition_cols = sorted(
-        set(c for c in comp_cols_present if c in X_work.columns)
+
+    subcategories = (
+        [subcategory]
+        if isinstance(subcategory, str)
+        else list(subcategory)
     )
-    # ------------------------------------------------------------------
-    # 2. Iterative VIF-based pruning for NON-composition features
-    # ------------------------------------------------------------------
-    def compute_vif(df):
-        X_num = df.select_dtypes(include=["number"]).dropna()
-        if X_num.shape[1] <= 1:
-            return pd.DataFrame({"feature": X_num.columns, "VIF": [1.0]})
-        vif_vals = [
-            variance_inflation_factor(X_num.values, i)
-            for i in range(X_num.shape[1])
+
+    dataframe_filtered = dataframe.loc[
+        dataframe[category_column].isin(subcategories)
+    ].copy()
+
+    if drop_col:
+        dataframe_filtered = dataframe_filtered.drop(
+            columns=[category_column],
+            errors="ignore",
+        )
+
+    return dataframe_filtered
+
+
+def filter_by_method(
+    dataframe: pd.DataFrame,
+    microscopy_method: str | Iterable[str],
+    method_column: str = "method",
+) -> pd.DataFrame:
+    """
+    Filter rows by one or more microscopy methods.
+
+    This fixed cohort-selection operation is safe before cross-validation.
+    """
+    if method_column not in dataframe.columns:
+        raise KeyError(
+            f"Required method column '{method_column}' was not found."
+        )
+
+    methods = (
+        [microscopy_method]
+        if isinstance(microscopy_method, str)
+        else list(microscopy_method)
+    )
+
+    return dataframe.loc[
+        dataframe[method_column].isin(methods)
+    ].copy()
+
+
+def get_aligned_groups(
+    dataframe: pd.DataFrame,
+    index: pd.Index,
+    group_col: str = "sample_id",
+) -> pd.Series:
+    """
+    Return sample_id values aligned exactly to rows retained by the cleaner.
+    """
+    if group_col not in dataframe.columns:
+        raise KeyError(
+            f"Group column '{group_col}' was not found in the dataframe."
+        )
+
+    return dataframe.loc[index, group_col].copy()
+
+
+# =============================================================================
+# Diagnostics
+# =============================================================================
+
+def diagnose_nan_patterns(
+    dataframe: pd.DataFrame,
+    target_col: str = "UTS (MPa)",
+) -> pd.DataFrame:
+    """
+    Return missing-data diagnostics without modifying the dataframe.
+
+    Do not use this output for global feature selection. Missingness thresholds
+    are fitted only from cross-validation training folds.
+    """
+    feature_groups = {
+        "Target": [target_col],
+        "Chemistry": list(CHEMISTRY_COLUMNS),
+        "Morphology": [
+            column
+            for column in dataframe.columns
+            if column.startswith("morph_")
+        ],
+        "GLCM": [
+            column
+            for column in dataframe.columns
+            if column.startswith("glcm_")
+        ],
+        "LBP": [
+            column
+            for column in dataframe.columns
+            if column.startswith("lbp_")
+        ],
+        "S2": [
+            column
+            for column in dataframe.columns
+            if column.startswith("s2_")
+        ],
+        "Gram": [
+            column
+            for column in dataframe.columns
+            if column.startswith(
+                (
+                    "conv1_",
+                    "layer1_",
+                    "layer2_",
+                    "layer3_",
+                    "layer4_",
+                    "cross_",
+                    "global_",
+                    "multiscale_",
+                )
+            )
+        ],
+    }
+
+    records: list[dict[str, Any]] = []
+
+    for group_name, columns in feature_groups.items():
+        available_columns = [
+            column
+            for column in columns
+            if column in dataframe.columns
         ]
-        return pd.DataFrame({"feature": X_num.columns, "VIF": vif_vals})
 
-    improved = True
-    while improved:
-        improved = False
+        if not available_columns:
+            continue
 
-        vif_df = compute_vif(X_work)
-        # Exclude composition columns from removal
-        vif_df = vif_df[~vif_df["feature"].isin(composition_cols)]
-        vif_df = vif_df.sort_values("VIF", ascending=False)
+        group_data = dataframe.loc[:, available_columns]
 
-        if vif_df.empty:
-            break
+        records.append(
+            {
+                "group": group_name,
+                "n_features": len(available_columns),
+                "mean_missing_percent": round(
+                    100.0 * group_data.isna().mean().mean(),
+                    4,
+                ),
+                "rows_with_any_missing": int(
+                    group_data.isna().any(axis=1).sum()
+                ),
+                "rows_complete": int(
+                    (~group_data.isna().any(axis=1)).sum()
+                ),
+            }
+        )
 
-        top_feat, top_vif = vif_df.iloc[0]["feature"], vif_df.iloc[0]["VIF"]
+    return pd.DataFrame(records).sort_values(
+        "mean_missing_percent",
+        ascending=False,
+        ignore_index=True,
+    )
 
-        if top_vif <= vif_threshold:
-            break  # worst non-composition VIF acceptable
 
-        # Identify strongly correlated partners of top_feat
-        corr = X_work.corr(numeric_only=True)
-        if top_feat not in corr.columns:
-            break
+def diagnose_infinity_sources(
+    dataframe: pd.DataFrame,
+) -> pd.DataFrame:
+    """Return per-feature counts of positive and negative infinity."""
+    numeric_columns = dataframe.select_dtypes(include=np.number).columns
+    records: list[dict[str, Any]] = []
 
-        partners = corr[top_feat].abs().sort_values(ascending=False)
-        partners = partners[
-            (partners.index != top_feat)
-            & (partners > pairwise_corr_threshold)
-        ]
+    for column in numeric_columns:
+        positive_infinity = int((dataframe[column] == np.inf).sum())
+        negative_infinity = int((dataframe[column] == -np.inf).sum())
+        total_infinity = positive_infinity + negative_infinity
 
-        if partners.empty:
-            # No strong partner: drop the high-VIF feature itself
-            drop = top_feat
-        else:
-            # Within the high-corr group, drop the feature that is
-            # most redundant: highest mean abs correlation to all others.
-            candidate_group = [top_feat] + partners.index.tolist()
-            subcorr = corr.loc[candidate_group, candidate_group].abs()
-            mean_corr = subcorr.mean(axis=1)
-
-            # Never drop composition features
-            mean_corr = mean_corr.drop(
-                labels=[c for c in mean_corr.index if c in composition_cols],
-                errors="ignore",
+        if total_infinity > 0:
+            records.append(
+                {
+                    "feature": column,
+                    "positive_infinity": positive_infinity,
+                    "negative_infinity": negative_infinity,
+                    "total_infinity": total_infinity,
+                    "percent_infinity": round(
+                        100.0 * total_infinity / len(dataframe),
+                        4,
+                    ),
+                }
             )
 
-            drop = mean_corr.sort_values(ascending=False).index[0]
+    if not records:
+        return pd.DataFrame(
+            columns=[
+                "feature",
+                "positive_infinity",
+                "negative_infinity",
+                "total_infinity",
+                "percent_infinity",
+            ]
+        )
 
-        X_work = X_work.drop(columns=drop)
-        removed.append(drop)
-        improved = True
-
-    if "sample_id" in X.columns:
-        X_work["sample_id"] = X["sample_id"]
-
-    return X_work, removed, created_composites
-
-def clean_data_simple(df, target_col='UTS (MPa)', id_cols=None, 
-                     impute_method='category', handle_inf='clip', verbose=True):
-    """
-    Simplified data cleaning with smart defaults.
-    
-    Parameters:
-        df: Input DataFrame
-        target_col: Target column name
-        id_cols: List of ID/metadata columns to exclude
-        impute_method: 'none' (drop NaN rows), 'simple' (median all), 
-                      'category' (median by feature type) - RECOMMENDED
-        handle_inf: How to handle infinity values:
-                   'clip' - Replace with large finite values (default)
-                   'nan' - Replace with NaN then impute
-                   'drop_features' - Drop features with any infinity
-        verbose: Print progress messages
-    
-    Returns:
-        X, y: Cleaned features and target
-    """
-    if verbose:
-        print(f"\n{'='*80}")
-        print("DATA CLEANING PIPELINE")
-        print(f"{'='*80}\n")
-    
-    if id_cols is None:
-        id_cols = []
-    
-    # Define columns to exclude
-    target_cols = ['YS (MPa)', 'UTS (MPa)', 'Uniform EL (%)', 'Total EL (%)',
-                   'Area Reduction (%)', 'Absorbed Energy (J/cm²)', 'Hardness (HV)', 
-                   'n2', "Young's modulus [GPa]", 'Young modulus [GPa]']
-    
-    chemistry_cols = ["Al", "B", "C", "Ca", "Ce", "Co", "Cr", "Cu", "Er", "La", "Mg", "Mn",
-                     "Mo", "N", "Nb", "Ni", "O", "P", "S", "Si", "Sm", "Sn", "Ti", "Ta",
-                     "V", "W", "Zn", "Zr", "Fe"]
-    
-    X = df.copy()
-    y = df[target_col].copy()
-    
-    if verbose:
-        print(f"Initial: {X.shape[0]} rows, {X.shape[1]} columns")
-    
-    # STEP 1: Drop rows with missing target
-    valid_target = y.notna()
-    X = X[valid_target]
-    y = y[valid_target]
-    
-    if verbose:
-        print(f"Step 1: Removed {(~valid_target).sum()} rows with missing target → {len(X)} rows")
-    
-    # STEP 2: Handle chemistry (fill with 0, calculate balance)
-    chem_available = [c for c in chemistry_cols if c in X.columns]
-    if chem_available:
-        # if 'Material' in X.columns:      # balance material does not provide new info, according to abaltion study and the decision was made to drop it for sake of interpretability
-        #     X = calculate_balance_composition(X, chem_available)
-        X[chem_available] = X[chem_available].fillna(0)
-
-        if verbose:
-            print("Step 2: Chemistry features filled with 0 (absence)")
-            
-    if X['Material'].unique()[0]=='Steel' and 'Fe' in X.columns: # drop Fe for steels
-        X = X.copy().drop(columns=["Fe"])   
-
-    # STEP 3: Remove ID and target columns
-    cols_to_drop = list(set(id_cols + target_cols + ['Material', 'Other']))
-    X = X.drop(columns=[c for c in cols_to_drop if c in X.columns], errors='ignore')
-    
-    if verbose:
-        print(f"Step 3: Removed ID/target columns → {X.shape[1]} feature columns")
-
-    # STEP 3b: Drop strictly constant features (including constant-zero elements)
-    # This is the only structural feature drop; rare non-constant elements are kept.
-    nunique = X.nunique(dropna=False)
-    constant_features = nunique[nunique <= 1].index.tolist()
-    if constant_features:
-        X = X.drop(columns=constant_features)
-        if verbose:
-            print(f"Step 3b: Dropped {len(constant_features)} constant features → {X.shape[1]} features")
-            print(str(constant_features))
-
-    # STEP 4: Drop features with >80% NaN
-    nan_pct = X.isna().mean()
-    high_nan_features = nan_pct[nan_pct > 0.80].index.tolist()
-    
-    if high_nan_features:
-        X = X.drop(columns=high_nan_features)
-        if verbose:
-            print(f"Step 4: Dropped {len(high_nan_features)} features with >80% NaN → {X.shape[1]} features")
-            gram_dropped = len([c for c in high_nan_features if any(x in c for x in ['conv', 'layer', 'cross_', 'global_', 'multi_scale'])])
-            if gram_dropped > 0:
-                print(f"        ⚠ {gram_dropped} Gram features dropped (likely extraction failure)")
-    else:
-        if verbose:
-            print("Step 4: No features >80% NaN ✓")
-
-    # STEP 5: Drop duplicate/redundant features
-    redundant = ['resolution_um', 'resolution_px']
-    X = X.drop(columns=[c for c in redundant if c in X.columns], errors='ignore')
-    
-    # STEP 6: Critical feature check - drop rows missing um_per_pixel
-    if 'um_per_pixel' in X.columns:
-        missing_scale = X['um_per_pixel'].isna()
-        if missing_scale.any():
-            X = X[~missing_scale]
-            y = y.loc[X.index]
-            if verbose:
-                print(f"Step 5: Dropped {missing_scale.sum()} rows missing um_per_pixel (critical)")
-    
-    # STEP 7: Handle infinity values BEFORE imputation (critical!)
-    num_cols = X.select_dtypes(include=[np.number]).columns
-    inf_mask = np.isinf(X[num_cols].values)
-    n_infs = inf_mask.sum()
-    
-    if n_infs > 0:
-        if verbose:
-            print(f"\n⚠️  Found {n_infs} infinity values before imputation!")
-        
-        cols_with_inf = []
-        for col in num_cols:
-            if np.isinf(X[col]).any():
-                n_inf = np.isinf(X[col]).sum()
-                cols_with_inf.append((col, n_inf))
-        
-        if verbose and len(cols_with_inf) <= 20:
-            print(f"    Columns with infinity ({len(cols_with_inf)}):")
-            for col, n in sorted(cols_with_inf, key=lambda x: x[1], reverse=True):
-                print(f"      - {col}: {n} values")
-        elif verbose:
-            print(f"    Columns with infinity: {len(cols_with_inf)} (showing top 10)")
-            for col, n in sorted(cols_with_inf, key=lambda x: x[1], reverse=True)[:10]:
-                print(f"      - {col}: {n} values")
-        
-        if handle_inf == 'drop_features':
-            drop_cols = [col for col, _ in cols_with_inf]
-            X = X.drop(columns=drop_cols)
-            if verbose:
-                print(f"    ✓ Dropped {len(drop_cols)} features with infinity values")
-        
-        elif handle_inf == 'nan':
-            for col, _ in cols_with_inf:
-                X.loc[np.isinf(X[col]), col] = np.nan
-            if verbose:
-                print(f"    ✓ Replaced infinity with NaN in {len(cols_with_inf)} features (will impute)")
-        
-        else:  # handle_inf == 'clip' (default)
-            for col in num_cols:
-                if not np.isinf(X[col]).any():
-                    continue
-                finite_vals = X[col][np.isfinite(X[col])]
-                if len(finite_vals) > 0:
-                    col_max = finite_vals.max()
-                    col_min = finite_vals.min()
-                    col_std = finite_vals.std()
-                    if col_max > 0:
-                        pos_clip = min(col_max * 10, col_max + 5 * col_std)
-                    else:
-                        pos_clip = 1e10
-                    if col_min < 0:
-                        neg_clip = max(col_min * 10, col_min - 5 * col_std)
-                    else:
-                        neg_clip = -1e10
-                else:
-                    pos_clip = 1e10
-                    neg_clip = -1e10
-                X.loc[X[col] == np.inf, col] = pos_clip
-                X.loc[X[col] == -np.inf, col] = neg_clip
-            
-            if verbose:
-                print("    ✓ Clipped infinity values to finite bounds")
-    
-    # STEP 8: Imputation (now infinity-free)
-    if impute_method == 'none':
-        before = len(X)
-        X = X.dropna()
-        y = y.loc[X.index]
-        dropped = before - len(X)
-        if verbose:
-            print(f"Step 6: IMPUTATION = None → Dropped {dropped} rows with any NaN → {len(X)} rows")
-    
-    elif impute_method == 'simple':
-        num_cols = X.select_dtypes(include=[np.number]).columns
-        cols_with_nan = [c for c in num_cols if X[c].isna().any()]
-        if cols_with_nan:
-            X[cols_with_nan] = SimpleImputer(strategy='median').fit_transform(X[cols_with_nan])
-            if verbose:
-                print(f"Step 6: IMPUTATION = Simple median → Imputed {len(cols_with_nan)} features")
-        else:
-            if verbose:
-                print("Step 6: IMPUTATION = Simple median → No features need imputation ✓")
-    
-    elif impute_method == 'category':
-        if verbose:
-            print("Step 6: IMPUTATION = Category-aware median")
-        
-        feature_blocks = {
-            'Morphology': [c for c in X.columns if c.startswith('morph_')],
-            'GLCM': [c for c in X.columns if c.startswith('glcm_')],
-            'LBP': [c for c in X.columns if c.startswith('lbp_')],
-            'S2': [c for c in X.columns if c.startswith('s2_')],
-            'Gram': [c for c in X.columns if c.startswith(('conv', 'layer', 'cross_', 'global_', 'multi_scale'))],
-        }
-        
-        total_imputed = 0
-        for block_name, cols in feature_blocks.items():
-            if not cols:
-                continue
-            cols_with_nan = [c for c in cols if X[c].isna().any()]
-            if cols_with_nan:
-                X[cols_with_nan] = SimpleImputer(strategy='median').fit_transform(X[cols_with_nan])
-                total_imputed += len(cols_with_nan)
-                if verbose:
-                    print(f"        → {block_name:12}: Imputed {len(cols_with_nan):3d} features")
-        
-        num_cols = X.select_dtypes(include=[np.number]).columns
-        remaining_nan = [c for c in num_cols if X[c].isna().any()]
-        if remaining_nan:
-            X[remaining_nan] = SimpleImputer(strategy='median').fit_transform(X[remaining_nan])
-            total_imputed += len(remaining_nan)
-            if verbose:
-                print(f"        → {'Other':12}: Imputed {len(remaining_nan):3d} features")
-        
-        if verbose:
-            print(f"        Total imputed: {total_imputed} features")
-    
-    # STEP 9: Treading Multicollinearity
-    X, _, _ = clean_multicollinearity(
-        X,
-        chem_available,
-        vif_threshold=10.0,
-        pairwise_corr_threshold=0.9,
-        comp_corr_threshold=0.95,
-        protect_elements=("Fe",),
+    return pd.DataFrame(records).sort_values(
+        "total_infinity",
+        ascending=False,
+        ignore_index=True,
     )
-    
-    # STEP 10: Final verification
-    remaining_nan = X.isna().sum().sum()
-    num_cols_final = X.select_dtypes(include=[np.number]).columns
-    remaining_inf = np.isinf(X[num_cols_final].values).sum() if len(num_cols_final) > 0 else 0
-    
-    if verbose:
-        print(f"\n{'='*80}")
-        print("CLEANING SUMMARY")
-        print(f"{'='*80}")
-        print(f"Final shape:          {X.shape}")
-        print(f"Samples retained:     {len(X)}/{len(df)} ({100*len(X)/len(df):.1f}%)")
-        print(f"Features retained:    {X.shape[1]}")
-        print(f"Remaining NaNs:       {remaining_nan}")
-        print(f"Remaining infinities: {remaining_inf}")
-        
-        if remaining_nan == 0 and remaining_inf == 0:
-            print("\n✓✓✓ DATA IS CLEAN AND ML-READY! ✓✓✓")
-        else:
-            if remaining_nan > 0:
-                print(f"\n⚠️  WARNING: {remaining_nan} NaN values remain!")
-            if remaining_inf > 0:
-                print(f"⚠️  WARNING: {remaining_inf} infinity values remain!")
-        print(f"{'='*80}\n")
-    
-    return X, y
-
-def quick_clean(df, target_col='UTS (MPa)', id_cols=None, handle_inf='clip'):
-    """
-    Ultra-simple one-line cleaning for quick testing.
-    Uses category-aware imputation (recommended).
-    
-    Parameters:
-        df: Input DataFrame
-        target_col: Target column name
-        id_cols: List of ID columns (optional)
-        handle_inf: 'clip', 'nan', or 'drop_features'
-    
-    Returns:
-        X, y: Clean features and target, ready for ML
-    """
-    return clean_data_simple(df, target_col, id_cols, 
-                            impute_method='category', handle_inf=handle_inf,
-                            verbose=False)
 
 
-# Convenience function - keep your original name for compatibility
-def separate_XY(df, target_col, id_cols=None, imputation_strategy='category', 
-               handle_inf='clip', verbose=False, microscopy_method=None):
+# =============================================================================
+# Internal validation and matrix construction helpers
+# =============================================================================
+
+def get_image_descriptor_columns(dataframe: pd.DataFrame) -> list[str]:
+    """Return numeric image-derived descriptor columns only."""
+    numeric_columns = set(
+        dataframe.select_dtypes(include=np.number).columns
+    )
+
+    return [
+        column
+        for column in dataframe.columns
+        if column in numeric_columns
+        and column.startswith(IMAGE_DESCRIPTOR_PREFIXES)
+    ]
+
+
+def calculate_image_completeness(
+    dataframe: pd.DataFrame,
+    image_columns: list[str],
+) -> pd.Series:
+    """Fraction of finite retained image descriptors available per row."""
+    if not image_columns:
+        raise ValueError(
+            "No image descriptor columns are available for completeness filtering."
+        )
+
+    image_data = dataframe.reindex(columns=image_columns).replace(
+        [np.inf, -np.inf],
+        np.nan,
+    )
+
+    return image_data.notna().mean(axis=1)
+
+
+def fit_image_missingness_filter(
+    feature_dataframe: pd.DataFrame,
+    feature_missingness_threshold: float = 0.80,
+    row_completeness_threshold: float = 0.80,
+) -> tuple[pd.DataFrame, dict[str, Any]]:
     """
-    Wrapper for backwards compatibility with original script.
-    Maps old parameter names to new function and optionally filters by microscopy method.
-    
-    Parameters:
-        df: Input DataFrame
-        target_col: Target column name
-        id_cols: List of ID columns
-        imputation_strategy: 'none', 'simple', or 'category' (recommended)
-        handle_inf: 'clip', 'nan', or 'drop_features'
-        verbose: Print progress
-        microscopy_method: list of microscopy methods considered ('OM', 'SEM', 'TEM'). Default to all ('None')
-    
-    Returns:
-        X, y: Cleaned features and target
+    Fit feature and row missingness rules on one training fold.
+
+    Feature removal: image descriptors with missing fraction strictly greater
+    than feature_missingness_threshold are removed.
+
+    Row removal: rows must have at least row_completeness_threshold of the
+    retained image descriptors observed and finite.
     """
-    if microscopy_method != None:
-        df_filtered = df[df['method'].isin(microscopy_method)]
+    if not 0.0 <= feature_missingness_threshold <= 1.0:
+        raise ValueError(
+            "feature_missingness_threshold must be between 0 and 1."
+        )
+
+    if not 0.0 <= row_completeness_threshold <= 1.0:
+        raise ValueError(
+            "row_completeness_threshold must be between 0 and 1."
+        )
+
+    image_columns = get_image_descriptor_columns(feature_dataframe)
+
+    if not image_columns:
+        raise ValueError("No numeric image descriptor columns were found.")
+
+    image_data = feature_dataframe[image_columns].replace(
+        [np.inf, -np.inf],
+        np.nan,
+    )
+
+    feature_missing_fraction = image_data.isna().mean(axis=0)
+
+    dropped_image_features = (
+        feature_missing_fraction.loc[
+            feature_missing_fraction > feature_missingness_threshold
+        ]
+        .index
+        .tolist()
+    )
+
+    retained_image_features = [
+        column
+        for column in image_columns
+        if column not in dropped_image_features
+    ]
+
+    row_completeness = calculate_image_completeness(
+        feature_dataframe,
+        retained_image_features,
+    )
+
+    retained_row_mask = (
+        row_completeness >= row_completeness_threshold
+    )
+
+    diagnostics = {
+        "all_image_features": image_columns,
+        "feature_missing_fraction": feature_missing_fraction,
+        "dropped_image_features": dropped_image_features,
+        "retained_image_features": retained_image_features,
+        "feature_missingness_threshold": feature_missingness_threshold,
+        "row_completeness": row_completeness,
+        "row_completeness_threshold": row_completeness_threshold,
+        "retained_row_mask": retained_row_mask,
+        "dropped_row_indices": feature_dataframe.index[
+            ~retained_row_mask
+        ].tolist(),
+    }
+
+    return feature_dataframe.loc[retained_row_mask].copy(), diagnostics
+
+
+def apply_image_missingness_filter(
+    feature_dataframe: pd.DataFrame,
+    diagnostics: dict[str, Any],
+) -> tuple[pd.DataFrame, pd.Series]:
+    """
+    Apply training-fitted image descriptor schema and row-completeness rule.
+
+    No missingness threshold is re-estimated on validation/query data.
+    """
+    retained_image_features = diagnostics["retained_image_features"]
+    row_completeness_threshold = diagnostics[
+        "row_completeness_threshold"
+    ]
+
+    missing_features = [
+        column
+        for column in retained_image_features
+        if column not in feature_dataframe.columns
+    ]
+
+    if missing_features:
+        raise KeyError(
+            "Validation/query data lack retained image descriptors: "
+            f"{missing_features}"
+        )
+
+    feature_dataframe = feature_dataframe.drop(
+        columns=diagnostics["dropped_image_features"],
+        errors="ignore",
+    )
+
+    row_completeness = calculate_image_completeness(
+        feature_dataframe,
+        retained_image_features,
+    )
+
+    retained_row_mask = (
+        row_completeness >= row_completeness_threshold
+    )
+
+    return (
+        feature_dataframe.loc[retained_row_mask].copy(),
+        row_completeness,
+    )
+
+
+def fit_morphology_feature_guardrail(
+    feature_dataframe: pd.DataFrame,
+    maximum_missing_fraction: float = 0.20,
+) -> tuple[pd.DataFrame, dict[str, Any]]:
+    """
+    Fit a morphology-specific coverage rule on one training fold.
+
+    Canonical morphology predictors whose missing (NaN or infinite) fraction
+    is strictly greater than maximum_missing_fraction are removed. Rows are
+    never removed: dropping images with failed segmentation would change the
+    study population and could introduce method-dependent selection bias.
+    """
+    if not 0.0 <= maximum_missing_fraction <= 1.0:
+        raise ValueError(
+            "maximum_missing_fraction must be between 0 and 1."
+        )
+
+    output = feature_dataframe.copy()
+
+    available_features = [
+        column
+        for column in CANONICAL_MORPHOLOGY_FEATURES
+        if column in output.columns
+    ]
+
+    if not available_features:
+        return output, {
+            "available_features": [],
+            "dropped_features": [],
+            "missing_fraction": {},
+            "maximum_missing_fraction": maximum_missing_fraction,
+        }
+
+    morphology_values = (
+        output[available_features]
+        .replace([np.inf, -np.inf], np.nan)
+    )
+
+    missing_fraction = morphology_values.isna().mean()
+
+    dropped_features = missing_fraction[
+        missing_fraction > maximum_missing_fraction
+    ].index.tolist()
+
+    output = output.drop(columns=dropped_features, errors="ignore")
+
+    return output, {
+        "available_features": available_features,
+        "dropped_features": dropped_features,
+        "missing_fraction": missing_fraction.to_dict(),
+        "maximum_missing_fraction": maximum_missing_fraction,
+    }
+
+
+def _validate_target_column(
+    dataframe: pd.DataFrame,
+    target_col: str,
+) -> None:
+    if target_col not in dataframe.columns:
+        raise KeyError(
+            f"Target column '{target_col}' was not found in the dataframe."
+        )
+
+
+def _validate_handle_inf(handle_inf: str) -> None:
+    valid_methods = {"clip", "nan", "drop_features"}
+
+    if handle_inf not in valid_methods:
+        raise ValueError(
+            f"handle_inf must be one of {sorted(valid_methods)}; "
+            f"received '{handle_inf}'."
+        )
+
+
+def _require_unique_index(dataframe: pd.DataFrame) -> None:
+    if not dataframe.index.is_unique:
+        raise ValueError(
+            "The dataframe index must be unique. Call "
+            "reset_index(drop=True) after cohort filtering."
+        )
+
+
+def _get_numeric_feature_columns(
+    dataframe: pd.DataFrame,
+) -> list[str]:
+    return dataframe.select_dtypes(include=np.number).columns.tolist()
+
+
+def _drop_missing_target_rows(
+    dataframe: pd.DataFrame,
+    target_col: str,
+) -> tuple[pd.DataFrame, pd.Series]:
+    _validate_target_column(dataframe, target_col)
+
+    valid_target = dataframe[target_col].notna()
+    dataframe_valid = dataframe.loc[valid_target].copy()
+    target = dataframe_valid[target_col].copy()
+
+    return dataframe_valid, target
+
+
+def _fill_chemistry(
+    dataframe: pd.DataFrame,
+    chemistry_columns: list[str],
+) -> int:
+    """
+    Fill chemistry NaNs with 0.0 using the predetermined database convention.
+
+    Returns the number of rows with no recorded chemistry values before fill.
+    """
+    if not chemistry_columns:
+        return 0
+
+    chemistry_block = dataframe.loc[:, chemistry_columns]
+
+    rows_without_composition = int(
+        chemistry_block.isna().all(axis=1).sum()
+    )
+
+    dataframe.loc[:, chemistry_columns] = chemistry_block.fillna(0.0)
+
+    return rows_without_composition
+
+
+def find_rare_support_chemistry_features(
+    dataframe: pd.DataFrame,
+    chemistry_columns: list[str],
+    group_column: str = "sample_id",
+    minimum_nonzero_groups: int = 5,
+) -> list[str]:
+    """
+    Return non-Fe chemistry features with non-zero concentrations in fewer
+    than minimum_nonzero_groups unique sample groups.
+
+    This function must be fitted on a training fold only. Chemistry NaN
+    values must already have been filled with 0.0 by _fill_chemistry().
+    """
+    if minimum_nonzero_groups < 1:
+        raise ValueError(
+            "minimum_nonzero_groups must be at least 1."
+        )
+
+    if group_column not in dataframe.columns:
+        raise KeyError(
+            f"Required grouping column '{group_column}' was not found."
+        )
+
+    alloy_columns = [
+        column
+        for column in chemistry_columns
+        if column != "Fe" and column in dataframe.columns
+    ]
+
+    if not alloy_columns:
+        return []
+
+    chemistry_block = dataframe.loc[:, alloy_columns]
+
+    # NaN != 0 evaluates to True, so unfilled NaNs would be counted as
+    # reported non-zero values. Fail loudly instead of miscounting.
+    if chemistry_block.isna().any().any():
+        raise ValueError(
+            "Chemistry NaN values must be filled with 0.0 before "
+            "find_rare_support_chemistry_features() is called."
+        )
+
+    # A group counts for an element if any of its rows has a non-zero value.
+    nonzero_by_group = (
+        chemistry_block.ne(0.0)
+        .groupby(dataframe[group_column], sort=False)
+        .any()
+    )
+
+    nonzero_group_counts = nonzero_by_group.sum(axis=0)
+
+    rare_support_features = nonzero_group_counts.loc[
+        nonzero_group_counts < minimum_nonzero_groups
+    ].index.tolist()
+
+    return rare_support_features
+
+
+def _build_feature_matrix(
+    dataframe: pd.DataFrame,
+    id_cols: Iterable[str],
+    metadata_cols: Iterable[str],
+    drop_fe: bool = True,
+) -> pd.DataFrame:
+    """
+    Build candidate predictors using fixed, schema-based exclusions.
+    """
+    columns_to_drop = set(TARGET_COLUMNS)
+    columns_to_drop.update(id_cols)
+    columns_to_drop.update(metadata_cols)
+    columns_to_drop.add("Other")
+
+    if drop_fe:
+        columns_to_drop.add("Fe")
+
+    return dataframe.drop(
+        columns=[
+            column
+            for column in columns_to_drop
+            if column in dataframe.columns
+        ],
+        errors="ignore",
+    )
+
+
+def _calculate_infinity_replacement(
+    series: pd.Series,
+) -> dict[str, float]:
+    """Calculate training-fold-only finite clipping limits."""
+    finite_values = series.loc[np.isfinite(series)]
+
+    if finite_values.empty:
+        return {
+            "positive_clip": 1.0e10,
+            "negative_clip": -1.0e10,
+        }
+
+    series_max = float(finite_values.max())
+    series_min = float(finite_values.min())
+    series_std = float(finite_values.std())
+
+    if not np.isfinite(series_std):
+        series_std = 0.0
+
+    if series_max > 0:
+        positive_clip = min(
+            series_max * 10.0,
+            series_max + 5.0 * series_std,
+        )
     else:
-        df_filtered = df.copy()
-    
-    return clean_data_simple(df_filtered, target_col, id_cols, 
-                            impute_method=imputation_strategy, 
-                            handle_inf=handle_inf, verbose=verbose)
+        positive_clip = series_max + 5.0 * series_std
+
+    if series_min < 0:
+        negative_clip = max(
+            series_min * 10.0,
+            series_min - 5.0 * series_std,
+        )
+    else:
+        negative_clip = series_min - 5.0 * series_std
+
+    return {
+        "positive_clip": float(positive_clip),
+        "negative_clip": float(negative_clip),
+    }
+
+def _replace_infinities(
+    dataframe: pd.DataFrame,
+    handle_inf: str,
+    infinity_replacements: dict[str, dict[str, float]] | None = None,
+    infinite_features_to_drop: Iterable[str] | None = None,
+) -> pd.DataFrame:
+    """
+    Apply an existing infinity-handling policy.
+
+    No feature-removal decision is made from validation or query data.
+    """
+    dataframe_processed = dataframe.copy()
+    numeric_columns = _get_numeric_feature_columns(dataframe_processed)
+
+    if handle_inf == "nan":
+        for column in numeric_columns:
+            infinity_mask = np.isinf(dataframe_processed[column])
+
+            if infinity_mask.any():
+                dataframe_processed.loc[infinity_mask, column] = np.nan
+
+        return dataframe_processed
+
+    if handle_inf == "drop_features":
+        return dataframe_processed.drop(
+            columns=list(infinite_features_to_drop or []),
+            errors="ignore",
+        )
+
+    if infinity_replacements is None:
+        raise ValueError(
+            "Infinity clipping requires training-fitted replacement limits."
+        )
+
+    for column, replacement in infinity_replacements.items():
+        if column not in dataframe_processed.columns:
+            continue
+
+        positive_mask = dataframe_processed[column] == np.inf
+        negative_mask = dataframe_processed[column] == -np.inf
+
+        dataframe_processed.loc[
+            positive_mask,
+            column,
+        ] = replacement["positive_clip"]
+
+        dataframe_processed.loc[
+            negative_mask,
+            column,
+        ] = replacement["negative_clip"]
+
+    return dataframe_processed
+
+
+def _fit_median_values(
+    dataframe: pd.DataFrame,
+) -> dict[str, float]:
+    """
+    Fit a training-fold median for every retained numeric feature.
+
+    A column without finite training values receives a deterministic 0.0 fill.
+    """
+    imputation_values: dict[str, float] = {}
+
+    for column in _get_numeric_feature_columns(dataframe):
+        median_value = dataframe[column].median(skipna=True)
+
+        if pd.isna(median_value):
+            median_value = 0.0
+
+        imputation_values[column] = float(median_value)
+
+    return imputation_values
+
+
+def _apply_median_values(
+    dataframe: pd.DataFrame,
+    imputation_values: dict[str, float],
+) -> pd.DataFrame:
+    """Apply only training-fitted median values."""
+    dataframe_processed = dataframe.copy()
+
+    for column, median_value in imputation_values.items():
+        if column in dataframe_processed.columns:
+            dataframe_processed[column] = dataframe_processed[
+                column
+            ].fillna(median_value)
+
+    return dataframe_processed
+
+def _validate_composition(
+    dataframe: pd.DataFrame,
+    chemistry_columns: list[str],
+) -> None:
+    """
+    Raise an error if any row has no reported alloying-element composition.
+
+    Fe is the steel balance element and is excluded from this test. A valid
+    steel record must contain at least one non-Fe elemental value.
+    """
+    alloy_columns = [
+        column
+        for column in chemistry_columns
+        if column != "Fe"
+    ]
+
+    if not alloy_columns:
+        raise KeyError(
+            "No alloying-element columns from CHEMISTRY_COLUMNS were found."
+        )
+
+    rows_without_composition = dataframe[alloy_columns].isna().all(axis=1)
+
+    if not rows_without_composition.any():
+        return
+
+    if "sample_id" in dataframe.columns:
+        bad_sample_ids = dataframe.loc[
+            rows_without_composition,
+            "sample_id",
+        ].astype(str).tolist()
+
+        identifier_text = f"sample_id values: {bad_sample_ids}"
+    else:
+        bad_indices = dataframe.index[rows_without_composition].tolist()
+        identifier_text = f"row indices: {bad_indices}"
+
+    raise ValueError(
+        "Rows with no reported alloying-element composition were found. "
+        "This is a dataset error and must be corrected before modelling. "
+        f"Affected {identifier_text}"
+    )
+
+def _is_constant(series: pd.Series) -> bool:
+    """
+    Return True when a feature has zero or one distinct finite values.
+
+    NaN and +/-inf do not make a predictor informative because they are later
+    imputed or handled by the cleaning pipeline.
+    """
+    finite_values = series.loc[np.isfinite(series)]
+
+    return finite_values.nunique() <= 1
+
+
+# =============================================================================
+# Leakage-safe fold cleaning
+# =============================================================================
 
 def fit_cleaning_pipeline(
-    df,
-    target_col="UTS (MPa)",
-    id_cols=None,
-    impute_method="category",
-    handle_inf="clip",
-    vif_threshold=10.0,
-    pairwise_corr_threshold=0.9,
-    comp_corr_threshold=0.95,
-    protect_elements=(),
-    verbose=True
-):
+    dataframe: pd.DataFrame,
+    target_col: str = "UTS (MPa)",
+    id_cols: Iterable[str] | None = None,
+    metadata_cols: Iterable[str] | None = None,
+    missing_feature_threshold: float = 0.80,
+    handle_inf: str = "clip",
+    drop_fe: bool = True,
+    minimum_nonzero_chemical_groups: int = 5,
+    verbose: bool = True,
+    morphology_missing_threshold: float = 0.20,
+) -> tuple[pd.DataFrame, pd.Series, dict[str, Any]]:
+    """
+    Fit a cleaning pipeline only on a CV training partition.
+
+    Fixed operations:
+    - Drop missing target rows.
+    - Validate that every retained steel row has at least one reported
+      non-Fe chemistry value.
+    - Fill missing values in reported chemistry columns with 0.0.
+    - Remove identifiers, metadata, all target columns, Fe, and Other.
+
+    Training-fitted operations:
+    - Remove non-Fe chemistry features with non-zero values in fewer than
+      minimum_nonzero_chemical_groups unique sample_id groups (after the
+      chemistry NaN fill and all training-row removals).
+    - Remove finite-value constant features.
+    - Remove canonical morphology features whose missing fraction exceeds
+      morphology_missing_threshold (stricter than the generic rule; rows are
+      retained). Runs after the image-level completeness rule.
+    - Remove features above the missingness threshold.
+    - Learn infinity handling from training data.
+    - Learn per-feature median-imputation values from training data.
+    """
+    _validate_target_column(dataframe, target_col)
+    _validate_handle_inf(handle_inf)
+    _require_unique_index(dataframe)
+
+    if not 0.0 <= missing_feature_threshold <= 1.0:
+        raise ValueError(
+            "missing_feature_threshold must be between 0.0 and 1.0."
+        )
+
+    if not 0.0 <= morphology_missing_threshold <= 1.0:
+        raise ValueError(
+            "morphology_missing_threshold must be between 0.0 and 1.0."
+        )
+
     if id_cols is None:
-        id_cols = []
+        id_cols = list(DEFAULT_ID_COLUMNS)
+    else:
+        id_cols = list(id_cols)
 
-    target_cols = [
-        "YS (MPa)", "UTS (MPa)", "Uniform EL (%)", "Total EL (%)",
-        "Area Reduction (%)", "Absorbed Energy (J/cm²)", "Hardness (HV)",
-        "n2", "Young's modulus [GPa]", "Young modulus [GPa]"
-    ]
+    if metadata_cols is None:
+        metadata_cols = list(DEFAULT_METADATA_COLUMNS)
+    else:
+        metadata_cols = list(metadata_cols)
 
-    chemistry_cols = [
-        "Al", "B", "C", "Ca", "Ce", "Co", "Cr", "Cu", "Er", "La", "Mg", "Mn",
-        "Mo", "N", "Nb", "Ni", "O", "P", "S", "Si", "Sm", "Sn", "Ti", "Ta",
-        "V", "W", "Zn", "Zr", "Fe"
-    ]
+    n_input_rows = len(dataframe)
 
-    X = df.copy()
-    y = X[target_col].copy() if target_col in X.columns else None
-
-    if y is not None:
-        valid_target = y.notna()
-        X = X.loc[valid_target].copy()
-        y = y.loc[valid_target].copy()
-
-    chem_available = [c for c in chemistry_cols if c in X.columns]
-    if chem_available:
-        X[chem_available] = X[chem_available].fillna(0)
-        X = calculate_balance_composition(X, chem_available)
-
-    cols_to_drop = list(set(id_cols + target_cols + ["Material", "Other"]))
-    cols_to_drop = [c for c in cols_to_drop if c in X.columns]
-    X = X.drop(columns=cols_to_drop, errors="ignore")
-
-    constant_features = X.columns[X.nunique(dropna=False) <= 1].tolist()
-    X = X.drop(columns=constant_features, errors="ignore")
-
-    nan_pct = X.isna().mean()
-    high_nan_features = nan_pct[nan_pct > 0.80].index.tolist()
-    X = X.drop(columns=high_nan_features, errors="ignore")
-
-    redundant = [c for c in ["resolution_um", "resolution_px"] if c in X.columns]
-    X = X.drop(columns=redundant, errors="ignore")
-
-    num_cols = X.select_dtypes(include=np.number).columns.tolist()
-    inf_replacement = {}
-
-    if handle_inf == "clip":
-        for col in num_cols:
-            if not np.isinf(X[col]).any():
-                continue
-            finite_vals = X.loc[np.isfinite(X[col]), col]
-            if len(finite_vals) > 0:
-                col_max = finite_vals.max()
-                col_min = finite_vals.min()
-                col_std = finite_vals.std()
-                pos_clip = min(col_max * 10, col_max + 5 * col_std) if col_max > 0 else 1e10
-                neg_clip = max(col_min * 10, col_min - 5 * col_std) if col_min < 0 else -1e10
-            else:
-                pos_clip = 1e10
-                neg_clip = -1e10
-
-            X.loc[X[col] == np.inf, col] = pos_clip
-            X.loc[X[col] == -np.inf, col] = neg_clip
-            inf_replacement[col] = {"pos_clip": pos_clip, "neg_clip": neg_clip}
-
-    elif handle_inf == "nan":
-        for col in num_cols:
-            if np.isinf(X[col]).any():
-                X.loc[np.isinf(X[col]), col] = np.nan
-
-    elif handle_inf == "dropfeatures":
-        inf_cols = [col for col in num_cols if np.isinf(X[col]).any()]
-        X = X.drop(columns=inf_cols, errors="ignore")
-
-    impute_values = {}
-    num_cols = X.select_dtypes(include=np.number).columns.tolist()
-    for col in num_cols:
-        if X[col].isna().any():
-            median_val = X[col].median()
-            X[col] = X[col].fillna(median_val)
-            impute_values[col] = median_val
-
-    chem_available = [c for c in chemistry_cols if c in X.columns]
-    X_mc, removed_features, created_composites = clean_multicollinearity(
-        X,
-        composition_cols=chem_available,
-        vif_threshold=vif_threshold,
-        pairwise_corr_threshold=pairwise_corr_threshold,
-        comp_corr_threshold=comp_corr_threshold,
-        protect_elements=protect_elements
+    dataframe_train, target_train = _drop_missing_target_rows(
+        dataframe,
+        target_col,
     )
+
+    if dataframe_train.empty:
+        raise ValueError(
+            f"No rows with observed '{target_col}' are available for fitting."
+        )
+
+    chemistry_available = [
+        column
+        for column in CHEMISTRY_COLUMNS
+        if column in dataframe_train.columns
+    ]
+
+    _validate_composition(
+        dataframe_train,
+        chemistry_available,
+    )
+
+    _fill_chemistry(
+        dataframe_train,
+        chemistry_available,
+    )
+
+    features_train = _build_feature_matrix(
+        dataframe_train,
+        id_cols=id_cols,
+        metadata_cols=metadata_cols,
+        drop_fe=drop_fe,
+    )
+
+    numeric_columns = _get_numeric_feature_columns(features_train)
+
+    nonnumeric_features = [
+        column
+        for column in features_train.columns
+        if column not in numeric_columns
+    ]
+
+    if nonnumeric_features:
+        features_train = features_train.drop(
+            columns=nonnumeric_features,
+            errors="ignore",
+        )
+
+    n_rows_removed_scale = 0
+
+    constant_features = [
+        column
+        for column in features_train.columns
+        if _is_constant(features_train[column])
+    ]
+
+    features_train = features_train.drop(
+        columns=constant_features,
+        errors="ignore",
+    )
+    
+    features_train, image_missingness = fit_image_missingness_filter(
+    features_train,
+    feature_missingness_threshold=0.80,
+    row_completeness_threshold=0.80,
+    )
+    
+    target_train = target_train.loc[features_train.index].copy()
+
+    # Morphology coverage guardrail: features only, rows are retained.
+    features_train, morphology_guardrail = fit_morphology_feature_guardrail(
+        features_train,
+        maximum_missing_fraction=morphology_missing_threshold,
+    )
+
+    # Chemistry NaNs are already 0.0 here. Counting uses the rows that
+    # actually remain in the training fold, so the support estimate matches
+    # what the model sees.
+    rare_support_chemistry_features = find_rare_support_chemistry_features(
+        dataframe_train.loc[features_train.index],
+        chemistry_columns=[
+            column
+            for column in chemistry_available
+            if column in features_train.columns
+        ],
+        group_column="sample_id",
+        minimum_nonzero_groups=minimum_nonzero_chemical_groups,
+    )
+
+    features_train = features_train.drop(
+        columns=rare_support_chemistry_features,
+        errors="ignore",
+    )
+
+    missing_fraction = (
+        features_train
+        .replace([np.inf, -np.inf], np.nan)
+        .isna()
+        .mean()
+    )
+
+    high_missing_features = missing_fraction.loc[
+        missing_fraction > missing_feature_threshold
+    ].index.tolist()
+
+    features_train = features_train.drop(
+        columns=high_missing_features,
+        errors="ignore",
+    )
+
+    infinity_replacements: dict[str, dict[str, float]] = {}
+    infinite_features_to_drop: list[str] = []
+
+    for column in _get_numeric_feature_columns(features_train):
+        if not np.isinf(features_train[column]).any():
+            continue
+
+        if handle_inf == "clip":
+            infinity_replacements[column] = _calculate_infinity_replacement(
+                features_train[column]
+            )
+
+        elif handle_inf == "drop_features":
+            infinite_features_to_drop.append(column)
+
+    features_train = features_train.drop(
+        columns=infinite_features_to_drop,
+        errors="ignore",
+    )
+
+    features_train = _replace_infinities(
+        features_train,
+        handle_inf=handle_inf,
+        infinity_replacements=infinity_replacements,
+        infinite_features_to_drop=infinite_features_to_drop,
+    )
+
+    n_features_with_missing = int(features_train.isna().any().sum())
+
+    imputation_values = _fit_median_values(features_train)
+
+    features_train = _apply_median_values(
+        features_train,
+        imputation_values,
+    )
+
+    if features_train.isna().any().any():
+        columns_remaining_missing = features_train.columns[
+            features_train.isna().any()
+        ].tolist()
+
+        raise ValueError(
+            "Missing values remain after training-fold imputation. "
+            f"Columns: {columns_remaining_missing}"
+        )
+
+    if np.isinf(features_train.to_numpy(dtype=float)).any():
+        raise ValueError(
+            "Infinite values remain after training-fold infinity handling."
+        )
+
+    forbidden_features = set(TARGET_COLUMNS).intersection(
+        features_train.columns
+    )
+
+    if forbidden_features:
+        raise RuntimeError(
+            "Target columns reached the final training feature matrix: "
+            f"{sorted(forbidden_features)}"
+        )
 
     pipeline = {
         "target_col": target_col,
         "id_cols": id_cols,
+        "metadata_cols": metadata_cols,
+        "chemistry_cols": chemistry_available,
+        "drop_fe": drop_fe,
+        "nonnumeric_features": nonnumeric_features,
         "constant_features": constant_features,
-        "high_nan_features": high_nan_features,
-        "redundant_features": redundant,
-        "inf_replacement": inf_replacement,
-        "impute_values": impute_values,
-        "removed_features": removed_features,
-        "created_composites": created_composites,
-        "final_columns": X_mc.columns.tolist(),
-        "chemistry_cols": chemistry_cols,
-        "handle_inf": handle_inf
+        "rare_support_chemistry_features": rare_support_chemistry_features,
+        "minimum_nonzero_chemical_groups": minimum_nonzero_chemical_groups,
+        "high_missing_features": high_missing_features,
+        "missing_feature_threshold": missing_feature_threshold,
+        "handle_inf": handle_inf,
+        "infinite_features_to_drop": infinite_features_to_drop,
+        "infinity_replacements": infinity_replacements,
+        "imputation_values": imputation_values,
+        "final_columns": features_train.columns.tolist(),
+        "image_missingness": image_missingness,
+        "morphology_guardrail": morphology_guardrail,
     }
 
-    return X_mc, y, pipeline
+    if verbose:
+        print("=" * 80)
+        print("FITTED CLEANING PIPELINE")
+        print("=" * 80)
+        print(f"Target:                     {target_col}")
+        print(f"Input rows:                 {n_input_rows}")
+        print(f"Training rows retained:     {features_train.shape[0]}")
+        print(f"Training features retained: {features_train.shape[1]}")
+        print(f"Rows removed (no scale):    {n_rows_removed_scale}")
+        print(f"Constant features removed:  {len(constant_features)}")
+        print(
+            "Rare-support chem removed:  "
+            f"{len(rare_support_chemistry_features)}"
+        )
+        print(
+            "Morphology feats removed:   "
+            f"{len(morphology_guardrail['dropped_features'])}"
+        )
+        print(f"High-NaN features removed:  {len(high_missing_features)}")
+        print(f"Inf features removed:       {len(infinite_features_to_drop)}")
+        print(f"Inf features clipped:       {len(infinity_replacements)}")
+        print(f"Features with NaN imputed:  {n_features_with_missing}")
+        print(f"Fe removed:                 {drop_fe}")
+        print("=" * 80)
 
-def apply_cleaning_pipeline(df, pipeline, target_col=None, verbose=True):
-    X = df.copy()
+    return features_train, target_train, pipeline
+
+
+def apply_cleaning_pipeline(
+    dataframe: pd.DataFrame,
+    pipeline: dict[str, Any],
+    target_col: str | None = None,
+    verbose: bool = True,
+) -> tuple[pd.DataFrame, pd.Series | None]:
+    """
+    Apply a training-fitted cleaning pipeline to validation or query data.
+
+    No data-derived statistic is fitted in this function. Output columns and
+    their order exactly match pipeline["final_columns"].
+    """
+    _require_unique_index(dataframe)
 
     if target_col is None:
         target_col = pipeline["target_col"]
 
-    y = X[target_col].copy() if target_col in X.columns else None
-    if y is not None:
-        valid_target = y.notna()
-        X = X.loc[valid_target].copy()
-        y = y.loc[valid_target].copy()
+    dataframe_apply = dataframe.copy()
+    target_apply: pd.Series | None = None
 
-    chemistry_cols = [c for c in pipeline["chemistry_cols"] if c in X.columns]
-    if chemistry_cols:
-        X[chemistry_cols] = X[chemistry_cols].fillna(0)
+    if target_col in dataframe_apply.columns:
+        valid_target = dataframe_apply[target_col].notna()
 
-    if "Material" in X.columns and X["Material"].nunique() == 1:
-        if X["Material"].iloc[0] == "Steel" and "Fe" in X.columns:
-            X = X.drop(columns=["Fe"])
+        dataframe_apply = dataframe_apply.loc[valid_target].copy()
+        target_apply = dataframe_apply[target_col].copy()
 
-    target_cols = [
-        "YS (MPa)", "UTS (MPa)", "Uniform EL (%)", "Total EL (%)",
-        "Area Reduction (%)", "Absorbed Energy (J/cm²)", "Hardness (HV)",
-        "n2", "Young's modulus [GPa]", "Young modulus [GPa]"
+    chemistry_columns = [
+        column
+        for column in pipeline["chemistry_cols"]
+        if column in dataframe_apply.columns
     ]
 
-    cols_to_drop = list(set(pipeline["id_cols"] + target_cols + ["Material", "Other"]))
-    X = X.drop(columns=[c for c in cols_to_drop if c in X.columns], errors="ignore")
+    _validate_composition(
+        dataframe_apply,
+        chemistry_columns,
+    )
 
-    X = X.drop(columns=[c for c in pipeline["constant_features"] if c in X.columns], errors="ignore")
-    X = X.drop(columns=[c for c in pipeline["high_nan_features"] if c in X.columns], errors="ignore")
-    X = X.drop(columns=[c for c in pipeline["redundant_features"] if c in X.columns], errors="ignore")
+    _fill_chemistry(
+        dataframe_apply,
+        chemistry_columns,
+    )
 
-    if "um_per_pixel" in X.columns and X["um_per_pixel"].isna().any():
-        missing_scale = X["um_per_pixel"].isna()
-        X = X.loc[~missing_scale].copy()
-        if y is not None:
-            y = y.loc[X.index]
+    features_apply = _build_feature_matrix(
+        dataframe_apply,
+        id_cols=pipeline["id_cols"],
+        metadata_cols=pipeline["metadata_cols"],
+        drop_fe=pipeline["drop_fe"],
+    )
 
-    if pipeline["handle_inf"] == "clip":
-        for col, vals in pipeline["inf_replacement"].items():
-            if col in X.columns:
-                X.loc[X[col] == np.inf, col] = vals["pos_clip"]
-                X.loc[X[col] == -np.inf, col] = vals["neg_clip"]
-    elif pipeline["handle_inf"] == "nan":
-        for col in X.select_dtypes(include=np.number).columns:
-            X.loc[np.isinf(X[col]), col] = np.nan
-    elif pipeline["handle_inf"] == "drop_features":
-        inf_cols = [col for col in X.select_dtypes(include=np.number).columns if np.isinf(X[col]).any()]
-        X = X.drop(columns=inf_cols, errors="ignore")
+    n_rows_removed_scale = 0
 
-    for col, median_val in pipeline["impute_values"].items():
-        if col in X.columns:
-            X[col] = X[col].fillna(median_val)
+    for key in (
+        "nonnumeric_features",
+        "constant_features",
+        "rare_support_chemistry_features",
+        "high_missing_features",
+        "infinite_features_to_drop",
+    ):
+        features_apply = features_apply.drop(
+            columns=pipeline[key],
+            errors="ignore",
+        )
 
-    # Recreate training composites from names like "Cr_plus_Ni"
-    for comp_name in pipeline["created_composites"]:
-        if comp_name in X.columns:
-            continue
+    features_apply, validation_image_completeness = (
+        apply_image_missingness_filter(
+            features_apply,
+            pipeline["image_missingness"],
+        )
+    )
+    
+    if target_apply is not None:
+        target_apply = target_apply.loc[features_apply.index].copy()
 
-        if "_plus_" not in comp_name:
-            if verbose:
-                print(f"Warning: cannot parse composite name {comp_name}")
-            continue
+    # Must follow the image filter: row completeness there is computed over
+    # the fitted retained_image_features, which still include these columns.
+    features_apply = features_apply.drop(
+        columns=pipeline["morphology_guardrail"]["dropped_features"],
+        errors="ignore",
+    )
 
-        a, b = comp_name.split("_plus_", 1)
+    features_apply = _replace_infinities(
+        features_apply,
+        handle_inf=pipeline["handle_inf"],
+        infinity_replacements=pipeline["infinity_replacements"],
+        infinite_features_to_drop=pipeline["infinite_features_to_drop"],
+    )
 
-        a_exists = a in X.columns
-        b_exists = b in X.columns
+    absent_columns = [
+        column
+        for column in pipeline["final_columns"]
+        if column not in features_apply.columns
+    ]
 
-        if a_exists and b_exists:
-            X[comp_name] = X[a] + X[b]
-        elif a_exists and not b_exists:
-            X[comp_name] = X[a]
-        elif b_exists and not a_exists:
-            X[comp_name] = X[b]
-        else:
-            X[comp_name] = 0.0
-            if verbose:
-                print(f"Warning: neither source column found for composite {comp_name}")
+    features_apply = features_apply.reindex(
+        columns=pipeline["final_columns"],
+    )
 
-    X = X.drop(columns=[c for c in pipeline["removed_features"] if c in X.columns], errors="ignore")
+    numeric_apply_columns = _get_numeric_feature_columns(features_apply)
 
-    for col in pipeline["final_columns"]:
-        if col not in X.columns:
-            X[col] = 0.0
+    n_unfitted_infinities = int(
+        np.isinf(
+            features_apply[numeric_apply_columns].to_numpy(dtype=float)
+        ).sum()
+    )
 
-    extra_cols = [c for c in X.columns if c not in pipeline["final_columns"]]
-    if extra_cols:
-        X = X.drop(columns=extra_cols, errors="ignore")
+    if n_unfitted_infinities > 0:
+        features_apply.loc[:, numeric_apply_columns] = features_apply.loc[
+            :, numeric_apply_columns
+        ].replace([np.inf, -np.inf], np.nan)
 
-    X = X[pipeline["final_columns"]]
+    features_apply = _apply_median_values(
+        features_apply,
+        pipeline["imputation_values"],
+    )
 
-    return X, y
+    if features_apply.isna().any().any():
+        columns_remaining_missing = features_apply.columns[
+            features_apply.isna().any()
+        ].tolist()
+
+        raise RuntimeError(
+            "Missing values remain after applying training-fold medians. "
+            f"Columns: {columns_remaining_missing}"
+        )
+
+    if np.isinf(features_apply.to_numpy(dtype=float)).any():
+        raise ValueError(
+            "Infinite values remain after applying the cleaning pipeline."
+        )
+
+    if list(features_apply.columns) != pipeline["final_columns"]:
+        raise RuntimeError(
+            "Applied feature order differs from the fitted training schema."
+        )
+
+    forbidden_features = set(TARGET_COLUMNS).intersection(
+        features_apply.columns
+    )
+
+    if forbidden_features:
+        raise RuntimeError(
+            "Target columns reached the applied feature matrix: "
+            f"{sorted(forbidden_features)}"
+        )
+
+    if target_apply is not None:
+        target_apply = target_apply.loc[features_apply.index].copy()
+
+    if verbose:
+        print(
+            "Applied fitted cleaning pipeline: "
+            f"{features_apply.shape[0]} rows x "
+            f"{features_apply.shape[1]} features"
+        )
+
+        if n_unfitted_infinities > 0:
+            print(
+                f"Warning: {n_unfitted_infinities} infinity values not "
+                "encountered in training were converted to NaN and then "
+                "filled with training-fold medians."
+            )
+
+        if absent_columns:
+            print(
+                "Warning: absent validation/query columns were filled with "
+                "training-fold medians:"
+            )
+            print(absent_columns)
+
+    return features_apply, target_apply
+
+# =============================================================================
+# Convenience helper for an explicit outer-CV fold
+# =============================================================================
+
+def prepare_clean_fold(
+    dataframe_train: pd.DataFrame,
+    dataframe_validation: pd.DataFrame,
+    target_col: str,
+    verbose: bool = False,
+    **fit_kwargs: Any,
+) -> tuple[
+    pd.DataFrame,
+    pd.Series,
+    pd.DataFrame,
+    pd.Series | None,
+    dict[str, Any],
+]:
+    """
+    Fit cleaning on one outer-CV training fold and apply it to its paired
+    validation fold without refitting any data-derived cleaning statistic.
+
+    Example
+    -------
+    X_train, y_train, X_valid, y_valid, cleaner = prepare_clean_fold(
+        dataframe_train=df_train,
+        dataframe_validation=df_valid,
+        target_col="UTS (MPa)",
+        missing_feature_threshold=0.80,
+        handle_inf="clip",
+        drop_fe=True,
+    )
+    """
+    X_train, y_train, cleaning_pipeline = fit_cleaning_pipeline(
+        dataframe_train,
+        target_col=target_col,
+        verbose=verbose,
+        **fit_kwargs,
+    )
+
+    X_validation, y_validation = apply_cleaning_pipeline(
+        dataframe_validation,
+        pipeline=cleaning_pipeline,
+        target_col=target_col,
+        verbose=verbose,
+    )
+
+    return (
+        X_train,
+        y_train,
+        X_validation,
+        y_validation,
+        cleaning_pipeline,
+    )
+
+
+# =============================================================================
+# Main: diagnostics and export of raw cohort/target source files
+# =============================================================================
 
 if __name__ == "__main__":
-    import os, sys
-    module_path = str.rsplit(os.path.abspath(''), os.path.sep, 1)[0]
-    sys.path.append(module_path)
-    from feat_reducer import CustomComprehensiveReducer
+    import os
+    import sys
 
-    STAINLESS_CATS = ["Ferritic Stainless Steel", "Duplex Stainless Steel", "Austenitic Stainless Steel"]
-    DP_CATS        = ["Conventional DP"]
-    STUDY_CATEGORIES = STAINLESS_CATS + DP_CATS
+    module_path = str.rsplit(os.path.abspath(""), os.path.sep, 1)[0]
+    print(f"Module path: {module_path}")
 
-    GROUPS = {
-        "ss_sem": {"categories": STAINLESS_CATS, "methods": ["SEM: SE", "SEM: BSE"]},
-        "dp_sem": {"categories": DP_CATS,        "methods": ["SEM: SE", "SEM: BSE"]},
-        "ss_om":  {"categories": STAINLESS_CATS, "methods": ["OM"]},
+    if module_path not in sys.path:
+        sys.path.insert(0, module_path)
+
+    INPUT_FILE = "descriptors_reduced.csv"
+
+    data_dir = os.path.join(module_path, "data")
+    xy_dir = os.path.join(data_dir, "Xy")
+    input_path = os.path.join(data_dir, INPUT_FILE)
+
+    if not os.path.isfile(input_path):
+        raise FileNotFoundError(
+            "Reduced descriptor CSV not found:\n"
+            f"{input_path}\n\n"
+            "Run feat_reducer.py first to create "
+            "data/descriptors_reduced.csv."
+        )
+
+    dataframe_full = pd.read_csv(input_path, low_memory=False)
+
+    required_columns = {
+        "sample_id",
+        "Category",
+        "method",
     }
 
-    id_columns = [
-        'obs_id', 'ID_name',
-        'Sample', 'Paper_ID', 'Material', 'Material_Subcategory', 'Category',
-        'Classification_Confidence', 'DOI', 'DOI_Enhanced', 'subfolder',
-        'image_file', 'image_name', 'image_number', 'resolution_um', 'method', 'Fig',
-        'doi', 'doi_norm', 'doi_url', 'pdf_filename', 'extraction_date', 'image_name_norm',
-        'cls_type', 'cls_confidence', 'morph_source', 'feat_morph_source',
-        'um_per_pixel',
-    ]
+    missing_required = sorted(
+        required_columns.difference(dataframe_full.columns)
+    )
 
-    # Load full descriptors and restrict to study population
-    print("\nLoading data...")
-    df_full = pd.read_csv(os.path.join(module_path, 'data', 'descriptors_full.csv'))
-    print(f"Loaded: {df_full.shape[0]} samples, {df_full.shape[1]} columns")
-    df_full = filter_by_subcategory(df_full, STUDY_CATEGORIES, drop_col=False)
+    if missing_required:
+        raise KeyError(
+            "The descriptor table lacks required cohort columns: "
+            f"{missing_required}"
+        )
 
-    # STEP 1: Diagnose NaN patterns on the study population
-    print("\n" + "="*80)
-    print("STEP 1: DIAGNOSE NaN PATTERNS")
-    print("="*80)
-    diagnose_nan_patterns(df_full, target_col='UTS (MPa)', show_plot=True)
+    print("=" * 80)
+    print("CLEAN_DATA: DIAGNOSTICS AND X/Y SOURCE EXPORT")
+    print("=" * 80)
+    print(f"Input file:     {input_path}")
+    print(
+        f"Loaded dataset: {dataframe_full.shape[0]} rows x "
+        f"{dataframe_full.shape[1]} columns"
+    )
 
-    xy_dir = os.path.join(module_path, 'data', 'Xy')
+    nan_summary = diagnose_nan_patterns(
+        dataframe_full,
+        target_col="UTS (MPa)",
+    )
+
+    infinity_summary = diagnose_infinity_sources(dataframe_full)
+
+    print("\nMISSINGNESS DIAGNOSTICS")
+    print(nan_summary.to_string(index=False))
+
+    print("\nINFINITY DIAGNOSTICS")
+
+    if infinity_summary.empty:
+        print("No infinity values found.")
+    else:
+        print(infinity_summary.to_string(index=False))
+
     os.makedirs(xy_dir, exist_ok=True)
 
-    for group_name, cfg in GROUPS.items():
-        print("\n" + "="*80)
-        print(f"GROUP: {group_name.upper()}")
-        print("="*80)
+    print("\n" + "=" * 80)
+    print("EXPORTING RAW COHORT/TARGET SOURCE TABLES")
+    print("=" * 80)
 
-        # STEP 2: Feature reduction (cached), fitted on this group only
-        reduced_path = os.path.join(module_path, 'data', f'descriptors_reduced_{group_name}.csv')
-        if not os.path.exists(reduced_path):
-            print(f"No reduced file found — running feat_reducer for '{group_name}'...")
-            df_group = df_full[
-                df_full['method'].isin(cfg['methods']) &
-                df_full['Category'].isin(cfg['categories'])
-            ].copy().reset_index(drop=True)
-            reducer = CustomComprehensiveReducer(reduce_s2_aggressively=False)
-            df_reduced, _ = reducer.reduce(df_group)
-            df_reduced.to_csv(reduced_path, index=False)
-            print(f"Saved: {reduced_path}")
-        else:
-            print(f"Loading cached: {reduced_path}")
-            df_reduced = pd.read_csv(reduced_path)
+    for group_name, group_definition in GROUP_DEFINITIONS.items():
 
-        id_cols = [c for c in id_columns if c in df_reduced.columns]
+        group_mask = (
+            dataframe_full["Category"].isin(
+                group_definition["categories"]
+            )
+            & dataframe_full["method"].isin(
+                group_definition["methods"]
+            )
+        )
 
-        # STEP 3: Clean and generate X/y
-        print("\n" + "="*80)
-        print("STEP 3: CLEAN DATA")
-        print("="*80)
+        dataframe_group = dataframe_full.loc[group_mask].copy()
+        dataframe_group = dataframe_group.reset_index(drop=True)
 
-        X_uts, y_uts = separate_XY(df_reduced, target_col='UTS (MPa)',    id_cols=id_cols, imputation_strategy='category')
-        X_ys,  y_ys  = separate_XY(df_reduced, target_col='YS (MPa)',     id_cols=id_cols, imputation_strategy='category')
-        X_el,  y_el  = separate_XY(df_reduced, target_col='Total EL (%)', id_cols=id_cols, imputation_strategy='category')
+        print(f"\nGROUP: {group_name.upper()}")
+        print(f"Rows after cohort selection: {len(dataframe_group)}")
 
-        X_uts.to_csv(os.path.join(xy_dir, f'X_{group_name}_uts.csv'), index=False)
-        y_uts.to_csv(os.path.join(xy_dir, f'y_{group_name}_uts.csv'), index=False)
-        X_ys.to_csv( os.path.join(xy_dir, f'X_{group_name}_ys.csv'),  index=False)
-        y_ys.to_csv( os.path.join(xy_dir, f'y_{group_name}_ys.csv'),  index=False)
-        X_el.to_csv( os.path.join(xy_dir, f'X_{group_name}_el.csv'),  index=False)
-        y_el.to_csv( os.path.join(xy_dir, f'y_{group_name}_el.csv'),  index=False)
+        if dataframe_group.empty:
+            print("Warning: no rows matched; no output files were written.")
+            continue
 
-        print(f"{group_name}: UTS {X_uts.shape}, YS {X_ys.shape}, EL {X_el.shape}")
+        print(
+            f"Unique sample_id values: "
+            f"{dataframe_group['sample_id'].nunique()}"
+        )
+
+        for target_short_name, target_col in TARGET_DEFINITIONS.items():
+
+            if target_col not in dataframe_group.columns:
+                print(
+                    f"Warning: missing target '{target_col}'; "
+                    "no files written."
+                )
+                continue
+
+            dataframe_target = dataframe_group.loc[
+                dataframe_group[target_col].notna()
+            ].copy()
+
+            if dataframe_target.empty:
+                print(
+                    f"Warning: no observed values for '{target_col}'; "
+                    "no files written."
+                )
+                continue
+
+            # These retain sample_id for GroupKFold. Dynamic cleaning remains
+            # inside the training/validation fold loop in the model script.
+            X_source = dataframe_target.drop(columns=[target_col]).copy()
+            y_source = dataframe_target.loc[:, [target_col]].copy()
+
+            x_filename = (
+                f"X_{group_name}_{target_short_name}.csv"
+            )
+            y_filename = (
+                f"y_{group_name}_{target_short_name}.csv"
+            )
+
+            x_path = os.path.join(xy_dir, x_filename)
+            y_path = os.path.join(xy_dir, y_filename)
+
+            X_source.to_csv(x_path, index=False)
+            y_source.to_csv(y_path, index=False)
+
+            n_x_columns = X_source.shape[1]
+            n_predictors = n_x_columns - int("sample_id" in X_source.columns)
+            n_y_columns = y_source.shape[1]
+            
+            print(
+                f"  {target_short_name:<3} | "
+                f"{len(X_source):4d} rows | "
+                f"{X_source['sample_id'].nunique():4d} samples | "
+                f"X: {n_x_columns:3d} columns "
+                f"({n_predictors:3d} predictors) | "
+                f"y: {n_y_columns} column | "
+                f"{x_filename} | {y_filename}"
+            )
+
+    print("\n" + "=" * 80)
+    print("EXPORT COMPLETE")
+    print("=" * 80)
+    print(
+        "The X files retain raw predictor values and sample_id. In modelling, "
+        "split by sample_id first; then call prepare_clean_fold() within "
+        "each training/validation fold."
+    )

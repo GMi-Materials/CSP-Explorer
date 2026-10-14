@@ -1863,7 +1863,7 @@ if __name__ == "__main__":
     print(module_path)
     
     from data_processing.combine_data import load_literature_data
-    from data_processing.clean_data_simple import filter_by_subcategory
+    from data_processing.clean_data import filter_by_subcategory
     df_literature = load_literature_data(os.path.join(module_path, "data", "literature_data.xlsx"), sheet_name='papers')
     df_filter = filter_by_subcategory(df_literature, ["Ferritic Stainless Steel", "Duplex Stainless Steel", 'Austenitic Stainless Steel',"Conventional DP"])
     subfolder_list = list(df_filter['subfolder'].unique())
@@ -1876,7 +1876,7 @@ if __name__ == "__main__":
     
     df = process_subfolders_with_doi(
         root_folder=path_images_folder,
-        output_csv=os.path.join(module_path, "results", "descriptors","descriptors_new.csv"),
+        output_csv=os.path.join(module_path, "results", "descriptors_new.csv"),
         mask_folder='masks',  
         mask_suffix='_mask',
         subfolder_filter=subfolder_list,
