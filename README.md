@@ -181,8 +181,6 @@ This script:
 
 You can adjust `N_VALUES`, `N_REPS`, and other settings at the bottom of `transfer_learning_curve.py` before running.
 
-> TODO before release: confirm that `transfer_learning_curve.py` and `shap_script.py` use the new file names and `prepare_clean_fold`; these scripts were not reviewed in this update.
-
 ### 4. SHAP‑based explainability
 
 The SHAP analysis is implemented in `shap_script.py` and leverages the final XGBoost models trained via `train_final_xgb_full` in `models_paper.py`.
@@ -445,5 +443,4 @@ generation and do not replace experimental mechanical testing.
 
 If you use this code or data in your own work, please cite:
 
-> Author(s), “A Transferable, Explainable AI Framework for Composition–Structure–Property Mapping from Steel Micrographs”, Journal, Year, Volume, Pages, DOI.
-(Replace with the final bibliographic information when available.)
+Millner, G., Wang, T.-W., Shen, S., Li, Y., & Chen, E. Y.-S. (2026). Explainable composition–structure–property modelling of steels using micrographs and transfer learning. Materials Today Communications, 116478. https://doi.org/10.1016/j.mtcomm.2026.116478
